@@ -1,13 +1,10 @@
 import fs from 'fs';
 
 async function processVideo(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const filename = filePath.split('/').pop();
-  const file = new File([buffer], filename, { type: 'video/mp4' });
   const formData = new FormData();
-  formData.append('video', file);
+  formData.append('video', new Blob([fs.readFileSync(filePath)]), filePath);
   
-  const uploadRes = await fetch('http://localhost:8080/api/upload', {
+  const uploadRes = await fetch('http://localhost:3000/api/upload', {
     method: 'POST',
     body: formData,
   });
@@ -16,7 +13,7 @@ async function processVideo(filePath) {
   console.log(`Uploaded ${filePath}, Job ID: ${jobId}`);
   
   while (true) {
-    const statusRes = await fetch(`http://localhost:8080/api/status/${jobId}`);
+    const statusRes = await fetch(`http://localhost:3000/api/status/${jobId}`);
     const status = await statusRes.json();
     console.log(`Job ${jobId} status: ${status.status}, processed: ${status.processedFrames}/${status.totalFrames}`);
     if (status.status === 'completed') {
@@ -27,7 +24,7 @@ async function processVideo(filePath) {
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
   
-  const resultRes = await fetch(`http://localhost:8080/api/result/${jobId}`);
+  const resultRes = await fetch(`http://localhost:3000/api/result/${jobId}`);
   const results = await resultRes.json();
   console.log(`Job ${jobId} finished. Fetched ${results.length} fingerprints.`);
   return results;
@@ -35,7 +32,7 @@ async function processVideo(filePath) {
 
 async function main() {
   console.log("Processing reference video...");
-  const refFps = await processVideo('test_real.mp4');
+  const refFps = await processVideo('real_video.mp4');
   console.log("Reference processing done.");
   
   // Create a 10s clip for target (already have test_10s.mp4? Let's check or use test_2m.mp4 again but just 10s)

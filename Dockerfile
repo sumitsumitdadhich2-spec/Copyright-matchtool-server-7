@@ -17,7 +17,7 @@ RUN npm ci --ignore-scripts || npm install --ignore-scripts
 COPY . .
 
 # Install server-specific dependencies (e.g., canvas, fluent-ffmpeg)
-RUN cd server && npm install --ignore-scripts
+RUN cd server && npm install
 
 # Build the frontend and backend (Vite + esbuild)
 RUN npm run build
