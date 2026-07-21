@@ -8,7 +8,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Copy package files
-COPY package.json package-lock.json ./
+COPY package.json bun.lock* package-lock.json* ./
 
 # Install dependencies (ignoring scripts to avoid issues if any)
 RUN npm ci --ignore-scripts || npm install --ignore-scripts
@@ -16,8 +16,8 @@ RUN npm ci --ignore-scripts || npm install --ignore-scripts
 # Copy the rest of the application
 COPY . .
 
-# Install server-specific dependencies (e.g., canvas, fluent-ffmpeg)
-RUN cd server && npm install
+# Install server-specific dependencies (e.g., canvas, fluent-ffmpeg) and rebuild canvas at root
+RUN cd server && npm install && cd .. && npm rebuild canvas
 
 # Build the frontend and backend (Vite + esbuild)
 RUN npm run build
