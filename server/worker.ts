@@ -1,6 +1,6 @@
 import { parentPort } from 'worker_threads';
 import { createCanvas } from 'canvas';
-import { getCropRects, processSubtitles, computeHashAndFeatures, computeSignature, FrameSignature } from '../src/shared/fingerprint';
+import { getCropRects, processSubtitles, computeHashAndFeatures, computeSignature, FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 
 parentPort?.on('message', async (message) => {
   const { id, frameBuffer, width, height } = message;
@@ -13,7 +13,7 @@ parentPort?.on('message', async (message) => {
     ctx.putImageData(imgData, 0, 0);
     
     const rects = getCropRects(width, height);
-    const variants: Record<string, { hash: string }> = {};
+    const variants: Record<string, VariantHashes> = {};
     
     // Downscale full frame to a standard intermediate size
     const H_down = 120;
@@ -63,7 +63,12 @@ parentPort?.on('message', async (message) => {
       // Compute signature only for the 'full' variant (one per frame)
       const isFullVariant = rect.name === 'full';
       const features = computeHashAndFeatures(finalImgData as any, isFullVariant);
-      variants[rect.name] = { hash: features.hash };
+      variants[rect.name] = {
+        hash: features.hash,
+        dhash: features.dhash,
+        fhash: features.fhash,
+        fdhash: features.fdhash
+      };
       if (isFullVariant && features.signature) {
         signature = features.signature;
       }

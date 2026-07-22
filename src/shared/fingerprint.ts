@@ -7,10 +7,21 @@ export interface FrameSignature {
   detailGrid: number[];
 }
 
+export interface VariantHashes {
+  /** Average hash (256-bit for 16x16), brightness-threshold based */
+  hash: string;
+  /** Gradient/difference hash (480-bit: horizontal + vertical), robust to color grading & brightness/contrast edits */
+  dhash?: string;
+  /** Average hash of the horizontally flipped frame (mirror-edit detection) */
+  fhash?: string;
+  /** Gradient hash of the horizontally flipped frame */
+  fdhash?: string;
+}
+
 export interface FrameFingerprint {
   frameIndex: number;
   timestamp: number;
-  variants: Record<string, { hash: string }>;
+  variants: Record<string, VariantHashes>;
   /** Optional: computed from the 'full' variant 16x16 image for weighted similarity */
   signature?: FrameSignature;
 }
@@ -232,10 +243,49 @@ export function computeSignature(imageData: ImageData): FrameSignature {
   return { colorGrid, skinScoreGrid, detailGrid };
 }
 
+/** Build average hash from gray values against a threshold */
+function buildAHash(g: Float32Array, len: number, threshold: number): string {
+  const bits = new Array<string>(len);
+  for (let i = 0; i < len; i++) bits[i] = g[i] >= threshold ? '1' : '0';
+  return bits.join('');
+}
+
+/**
+ * Build gradient (difference) hash: horizontal comparisons ((w-1)*h bits)
+ * followed by vertical comparisons (w*(h-1) bits).
+ * Gradient sign is invariant to brightness/contrast/gamma edits and most
+ * color grading, making it far more robust than average hash for edited videos.
+ */
+function buildDHash(g: Float32Array, width: number, height: number): string {
+  const bits: string[] = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      bits.push(g[y * width + x + 1] > g[y * width + x] ? '1' : '0');
+    }
+  }
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width; x++) {
+      bits.push(g[(y + 1) * width + x] > g[y * width + x] ? '1' : '0');
+    }
+  }
+  return bits.join('');
+}
+
+/** Horizontally flip a gray grid */
+function flipGraysH(g: Float32Array, width: number, height: number): Float32Array {
+  const out = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      out[y * width + x] = g[y * width + (width - 1 - x)];
+    }
+  }
+  return out;
+}
+
 export function computeHashAndFeatures(
   imageData: ImageData,
   includeSignature = false
-): { hash: string; signature?: FrameSignature } {
+): { hash: string; dhash: string; fhash: string; fdhash: string; signature?: FrameSignature } {
   const { width, height, data } = imageData;
   let totalGray = 0;
   const grays = new Float32Array(width * height);
@@ -260,9 +310,17 @@ export function computeHashAndFeatures(
   }
   const variance = sumSqDiff / (width * height);
   
-  let hash = '';
+  let hash: string;
+  let dhash: string;
+  let fhash: string;
+  let fdhash: string;
+
   if (variance < 1.0) {
+    // Flat frame — deterministic all-zero hashes
     hash = '0'.repeat(width * height);
+    dhash = '0'.repeat((width - 1) * height + width * (height - 1));
+    fhash = hash;
+    fdhash = dhash;
   } else {
     let currentGrays = grays;
     for (let pass = 0; pass < 3; pass++) {
@@ -287,13 +345,15 @@ export function computeHashAndFeatures(
       currentGrays = smoothedGrays;
     }
     
-    for (let i = 0; i < width * height; i++) {
-      hash += currentGrays[i] >= avgGray ? '1' : '0';
-    }
+    const flipped = flipGraysH(currentGrays, width, height);
+    hash   = buildAHash(currentGrays, width * height, avgGray);
+    dhash  = buildDHash(currentGrays, width, height);
+    fhash  = buildAHash(flipped, width * height, avgGray);
+    fdhash = buildDHash(flipped, width, height);
   }
 
   const signature = includeSignature ? computeSignature(imageData) : undefined;
-  return { hash, signature };
+  return { hash, dhash, fhash, fdhash, signature };
 }
 
 export function computeFingerprint(
@@ -304,7 +364,7 @@ export function computeFingerprint(
   timestamp: number
 ): FrameFingerprint {
   const rects = getCropRects(width, height);
-  const variants: Record<string, { hash: string }> = {};
+  const variants: Record<string, VariantHashes> = {};
   
   const H_down = 120;
   const W_down = Math.round(width * (H_down / height));
@@ -353,7 +413,12 @@ export function computeFingerprint(
     // Only compute signature for the 'full' variant
     const isFullVariant = rect.name === 'full';
     const features = computeHashAndFeatures(finalImgData, isFullVariant);
-    variants[rect.name] = { hash: features.hash };
+    variants[rect.name] = {
+      hash: features.hash,
+      dhash: features.dhash,
+      fhash: features.fhash,
+      fdhash: features.fdhash
+    };
     if (isFullVariant && features.signature) {
       fullVariantSignature = features.signature;
     }
