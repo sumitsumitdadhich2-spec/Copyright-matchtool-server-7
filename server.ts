@@ -265,10 +265,15 @@ async function startServer() {
 
       console.log(`[Match] Loaded ${movieFps.length} movie frames, ${shortFps.length} short frames. Running matching…`);
 
-      const segments = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames);
+      const result = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames);
 
-      console.log(`[Match] Done: ${segments.length} segments found.`);
-      res.json({ segments, movieFrames: movieFps.length, shortFrames: shortFps.length });
+      console.log(`[Match] Done: ${result.segments.length} segments, ${result.unmatchedRanges.length} unmatched ranges.`);
+      res.json({
+        segments: result.segments,
+        unmatchedRanges: result.unmatchedRanges,
+        movieFrames: movieFps.length,
+        shortFrames: shortFps.length
+      });
     } catch (err: any) {
       console.error('[Match] Error:', err);
       res.status(500).json({ error: err.message || String(err) });

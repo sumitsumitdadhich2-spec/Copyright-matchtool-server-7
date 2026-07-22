@@ -19,7 +19,13 @@ interface MatchedSegment {
   confidence: number;
   frameCount: number;
   isApproximate: boolean;
+  gapCount?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
+}
+
+interface UnmatchedRange {
+  shortStart: number;
+  shortEnd: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,9 +122,10 @@ export default function App() {
   const [showSettings, setShowSettings]               = useState(false);
 
   // Match results
-  const [segments, setSegments]   = useState<MatchedSegment[]>([]);
-  const [isMatching, setIsMatching] = useState(false);
-  const [matchStats, setMatchStats] = useState<{ movieFrames: number; shortFrames: number } | null>(null);
+  const [segments, setSegments]           = useState<MatchedSegment[]>([]);
+  const [unmatchedRanges, setUnmatched]   = useState<UnmatchedRange[]>([]);
+  const [isMatching, setIsMatching]       = useState(false);
+  const [matchStats, setMatchStats]       = useState<{ movieFrames: number; shortFrames: number } | null>(null);
 
   // Status / error
   const [status, setStatus]     = useState<string>('');
@@ -243,6 +250,7 @@ export default function App() {
     setIsProcessingTarget(true);
     setIsMatching(false);
     setSegments([]);
+    setUnmatched([]);
     setMatchStats(null);
     setPreviewSegment(null);
     setErrorMsg('');
@@ -294,9 +302,12 @@ export default function App() {
 
         const data = await matchRes.json();
         setSegments(data.segments || []);
+        setUnmatched(data.unmatchedRanges || []);
         setMatchStats({ movieFrames: data.movieFrames, shortFrames: data.shortFrames });
         setIsMatching(false);
-        setStatus(`Matching complete. ${(data.segments || []).length} segment(s) found.`);
+        const segs = data.segments || [];
+        const unmatched = data.unmatchedRanges || [];
+        setStatus(`Matching complete. ${segs.length} segment(s) found${unmatched.length > 0 ? `, ${unmatched.length} unmatched range(s)` : ' — full clip covered'}.`);
       } else {
         setIsMatching(true);
         setStatus('Running browser-side matching…');
@@ -616,6 +627,58 @@ export default function App() {
               </button>
             </div>
 
+            {/* ── Clip coverage timeline ── */}
+            {matchStats && matchStats.shortFrames > 0 && (() => {
+              const clipDur = segments.length > 0
+                ? Math.max(...segments.map(s => s.shortEnd), ...unmatchedRanges.map(u => u.shortEnd))
+                : 0;
+              if (clipDur <= 0) return null;
+              return (
+                <div className="px-5 py-4 border-b border-slate-800 space-y-2">
+                  <div className="flex justify-between text-xs text-slate-500 font-mono">
+                    <span>Clip coverage</span>
+                    <span>
+                      {unmatchedRanges.length === 0
+                        ? '✓ Full clip matched'
+                        : `${unmatchedRanges.length} unmatched range${unmatchedRanges.length !== 1 ? 's' : ''}`}
+                    </span>
+                  </div>
+                  {/* Stacked bar: green=matched, orange=unmatched */}
+                  <div className="relative h-6 rounded overflow-hidden bg-slate-800 flex">
+                    {(() => {
+                      // Build a sorted list of intervals with type
+                      type Bar = { start: number; end: number; kind: 'match' | 'gap'; conf: number; idx: number };
+                      const bars: Bar[] = [];
+                      segments.forEach((s, i) => bars.push({ start: s.shortStart, end: s.shortEnd, kind: 'match', conf: s.confidence, idx: i }));
+                      unmatchedRanges.forEach((u, i) => bars.push({ start: u.shortStart, end: u.shortEnd, kind: 'gap', conf: 0, idx: i }));
+                      bars.sort((a, b) => a.start - b.start);
+                      return bars.map((bar, i) => {
+                        const left  = (bar.start / clipDur) * 100;
+                        const width = Math.max(0.3, ((bar.end - bar.start) / clipDur) * 100);
+                        const conf  = bar.conf;
+                        const bg    = bar.kind === 'gap'
+                          ? 'bg-orange-700/60'
+                          : conf >= 80 ? 'bg-green-500' : conf >= 60 ? 'bg-yellow-500' : 'bg-blue-400';
+                        const label = bar.kind === 'match'
+                          ? `Seg ${bar.idx + 1}: ${fmt(bar.start)}–${fmt(bar.end)} (${conf.toFixed(0)}%)`
+                          : `Unmatched: ${fmt(bar.start)}–${fmt(bar.end)}`;
+                        return (
+                          <div key={i} title={label}
+                            className={`absolute top-0 h-full ${bg} transition-all`}
+                            style={{ left: `${left}%`, width: `${width}%` }} />
+                        );
+                      });
+                    })()}
+                  </div>
+                  <div className="flex items-center gap-4 text-[10px] text-slate-600">
+                    <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-green-500" /> High confidence match</span>
+                    <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-500" /> Medium confidence</span>
+                    <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-700/60" /> No match found</span>
+                  </div>
+                </div>
+              );
+            })()}
+
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-slate-950 text-slate-500 text-xs font-medium uppercase tracking-wider border-b border-slate-800">
@@ -666,7 +729,14 @@ export default function App() {
                         </td>
 
                         {/* Frame count */}
-                        <td className="px-4 py-3 font-mono text-xs text-slate-400">{seg.frameCount}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-slate-400">
+                          {seg.frameCount}
+                          {seg.gapCount != null && seg.gapCount > 0 && (
+                            <span className="ml-1 text-amber-500/70" title={`${seg.gapCount} low-confidence frame(s) skipped within segment`}>
+                              +{seg.gapCount}↗
+                            </span>
+                          )}
+                        </td>
 
                         {/* Confidence */}
                         <td className="px-4 py-3">
