@@ -228,11 +228,25 @@ async function startServer() {
   // 6. Match endpoint — runs groundMatchedSegments on two stored result JSONs
   app.post('/api/match', async (req, res) => {
     try {
-      const { movieJobId, shortJobId } = req.body as { movieJobId: string; shortJobId: string };
+      const {
+        movieJobId,
+        shortJobId,
+        minSimilarity,
+        minConsecutiveFrames
+      } = req.body as {
+        movieJobId: string;
+        shortJobId: string;
+        minSimilarity?: number;
+        minConsecutiveFrames?: number;
+      };
 
       if (!movieJobId || !shortJobId) {
         return res.status(400).json({ error: 'movieJobId and shortJobId are required' });
       }
+
+      // Validate optional params
+      const resolvedMinSim    = (typeof minSimilarity    === 'number' && minSimilarity    >= 40 && minSimilarity    <= 99) ? minSimilarity    : 82;
+      const resolvedMinFrames = (typeof minConsecutiveFrames === 'number' && minConsecutiveFrames >= 3 && minConsecutiveFrames <= 200) ? minConsecutiveFrames : 9;
 
       const movieResultPath = path.join(uploadDir, `${movieJobId}_result.json`);
       const shortResultPath = path.join(uploadDir, `${shortJobId}_result.json`);
@@ -251,7 +265,7 @@ async function startServer() {
 
       console.log(`[Match] Loaded ${movieFps.length} movie frames, ${shortFps.length} short frames. Running matching…`);
 
-      const segments = await groundMatchedSegments(shortFps, movieFps);
+      const segments = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames);
 
       console.log(`[Match] Done: ${segments.length} segments found.`);
       res.json({ segments, movieFrames: movieFps.length, shortFrames: shortFps.length });
