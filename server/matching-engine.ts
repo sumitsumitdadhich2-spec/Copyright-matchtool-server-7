@@ -60,8 +60,22 @@ export interface MatchResult {
 // Tuning constants
 // ---------------------------------------------------------------------------
 
-/** Movie-frame search window around expected position during walk */
+/**
+ * Movie-frame search window used in the BRUTE-FORCE SCAN (Pass 3 grouping)
+ * and for seed verification. Kept large so nothing is missed.
+ */
 const LOOK_AHEAD = 25;
+
+/**
+ * Movie-frame search window used during the DIRECTIONAL WALK.
+ * MUST be small: if it equals or exceeds the typical scene-cut jump,
+ * the walk bridges deliberate editor cuts and merges separate scenes
+ * into one giant segment.
+ *
+ * At 25 fps a ±6 frame window allows up to 0.24 s of natural encode
+ * drift without breaking the segment.  Any larger jump is a real cut.
+ */
+const WALK_LOOK_AHEAD = 6;
 
 /** Base minimum similarity (%) for a frame to extend the segment walk */
 const WALK_MIN_SIM = 58;
@@ -283,8 +297,8 @@ function walkOneDir(
     );
 
     const expectedMi = curMi + direction;
-    const lo = Math.max(0, expectedMi - LOOK_AHEAD);
-    const hi = Math.min(mSet.fps.length - 1, expectedMi + LOOK_AHEAD);
+    const lo = Math.max(0, expectedMi - WALK_LOOK_AHEAD);
+    const hi = Math.min(mSet.fps.length - 1, expectedMi + WALK_LOOK_AHEAD);
 
     let best = 0, bestMi = -1;
     for (let mi = lo; mi <= hi; mi++) {
@@ -543,14 +557,17 @@ export async function groundMatchedSegments(
   // Sort by clip timeline for display
   final.sort((a, b) => a.shortStart - b.shortStart);
 
-  // Recompute usedShort from accepted segments only (for unmatched range calc)
+  // Recompute usedShort from accepted segments only (for unmatched range calc).
+  // Use the exact frame timestamps stored in matchSequence — NOT a time-range
+  // sweep, which would incorrectly mark gap frames (between scenes) as matched.
+  const tToSi = new Map<string, number>();
+  shortFps.forEach((fp, si) => tToSi.set(fp.timestamp.toFixed(4), si));
+
   const usedFinal = new Uint8Array(shortFps.length);
   for (const seg of final) {
-    for (let si = 0; si < shortFps.length; si++) {
-      const ts = shortFps[si].timestamp;
-      if (ts >= seg.shortStart - 0.001 && ts <= seg.shortEnd + 0.001) {
-        usedFinal[si] = 1;
-      }
+    for (const frame of seg.matchSequence) {
+      const si = tToSi.get(frame.shortTime.toFixed(4));
+      if (si !== undefined) usedFinal[si] = 1;
     }
   }
 
