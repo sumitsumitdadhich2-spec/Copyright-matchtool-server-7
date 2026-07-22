@@ -249,6 +249,40 @@ function yieldIfNeeded(iter: number, every = 400): Promise<void> | null {
 }
 
 // ---------------------------------------------------------------------------
+// Scene-cut detection (short-clip only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compare two consecutive frames WITHIN sSet (for scene-cut detection).
+ * Uses the 'full' variant only for speed. Returns similarity 0–100.
+ */
+function shortConsecutiveSim(sSet: PreSet, si: number): number {
+  const svIdx = sSet.variantIdx.get('full') ?? 0;
+  const off1  = ((si - 1) * sSet.numVariants + svIdx) * 8;
+  const off2  = (si       * sSet.numVariants + svIdx) * 8;
+  return (1 - hammingAt(sSet.hashFlat, off1, sSet.hashFlat, off2) / 256) * 100;
+}
+
+/**
+ * Detect hard cuts in the short clip.
+ * isCut[si] = 1  →  si is the FIRST frame of a new scene (hard cut before it).
+ * isCut[0]  is always 0 (no cut before the first frame).
+ *
+ * Threshold 45 %: normal motion between consecutive frames at 25 fps is
+ * typically > 70 %; a hard cut drops it below ~35 %.  45 % gives comfortable
+ * headroom for heavy compression and fast motion without false positives.
+ */
+function detectSceneCuts(sSet: PreSet, threshold = 45): Uint8Array {
+  const isCut = new Uint8Array(sSet.fps.length);
+  for (let si = 1; si < sSet.fps.length; si++) {
+    if (shortConsecutiveSim(sSet, si) < threshold) {
+      isCut[si] = 1;
+    }
+  }
+  return isCut;
+}
+
+// ---------------------------------------------------------------------------
 // Directional walk (forward OR backward) from a seed position
 // ---------------------------------------------------------------------------
 
@@ -275,7 +309,8 @@ function walkOneDir(
   startSi: number,
   startMi: number,
   usedShort: Uint8Array,
-  direction: 1 | -1
+  direction: 1 | -1,
+  isCut: Uint8Array
 ): Array<{ si: number; mi: number; sim: number }> {
   const seq: Array<{ si: number; mi: number; sim: number }> = [];
   let curMi     = startMi;
@@ -289,6 +324,12 @@ function walkOneDir(
     nextSi += direction
   ) {
     if (usedShort[nextSi]) break; // collide with an already-accepted segment
+
+    // Stop at scene cuts — each scene must become its own segment.
+    // Forward walk: nextSi is the first frame of a new scene → stop before it.
+    // Backward walk: nextSi+1 was a scene-cut boundary → don't cross it backward.
+    if (direction === 1  && isCut[nextSi])          break;
+    if (direction === -1 && isCut[nextSi + 1])      break;
 
     // Relax threshold as segment grows (encoding noise tolerance)
     const adaptiveMin = Math.max(
@@ -334,10 +375,11 @@ function buildSegment(
   seedSi: number,
   seedMi: number,
   seedSim: number,
-  usedShort: Uint8Array
+  usedShort: Uint8Array,
+  isCut: Uint8Array
 ): RawSeq[] {
-  const backwardSeq = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort, -1);
-  const forwardSeq  = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort,  1);
+  const backwardSeq = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort, -1, isCut);
+  const forwardSeq  = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort,  1, isCut);
 
   // Backward seq is in descending si order → reverse to get ascending
   backwardSeq.reverse();
@@ -433,6 +475,14 @@ export async function groundMatchedSegments(
   console.log(`[Matcher] Precomputing hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames…`);
   const sSet = precompute(shortFps);
   const mSet = precompute(movieFps);
+
+  // Detect hard scene cuts in the short clip so the walk never bridges them.
+  const isCut   = detectSceneCuts(sSet);
+  const numCuts = isCut.reduce((n, v) => n + v, 0);
+  if (numCuts > 0) {
+    console.log(`[Matcher] Detected ${numCuts} scene cut(s) in short clip — each scene will be matched independently.`);
+  }
+
   console.log('[Matcher] Precompute done. Starting three-pass scan…');
 
   const usedShort = new Uint8Array(shortFps.length);
@@ -467,7 +517,7 @@ export async function groundMatchedSegments(
       if (seedSim < passMinSim) continue;
 
       // ---- Bidirectional walk ----
-      const seq = buildSegment(sSet, mSet, si, bestMi, seedSim, usedShort);
+      const seq = buildSegment(sSet, mSet, si, bestMi, seedSim, usedShort, isCut);
 
       if (seq.length < minConsecutiveFrames) continue;
 
@@ -517,6 +567,8 @@ export async function groundMatchedSegments(
 
       for (let j = k + 1; j < bestOf.length; j++) {
         const item = bestOf[j];
+        // Never merge across a scene cut — each scene must be its own segment
+        if (isCut[item.si]) break;
         // Gap in si indices between item and predecessor (already-matched frames between them)
         const siGap      = item.si - bestOf[j - 1].si;
         const expectedMi = curMi + siGap;
