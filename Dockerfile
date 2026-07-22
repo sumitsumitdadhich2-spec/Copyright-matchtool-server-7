@@ -10,14 +10,12 @@ WORKDIR /app
 # Copy package files
 COPY package.json bun.lock* package-lock.json* ./
 
-# Install dependencies (ignoring scripts to avoid issues if any)
-RUN npm ci --ignore-scripts || npm install --ignore-scripts
+# Install dependencies including canvas native compilation, then wipe npm cache
+# (single layer so node_modules is only snapshotted once in overlayfs)
+RUN npm ci && npm cache clean --force
 
 # Copy the rest of the application
 COPY . .
-
-# Rebuild native modules (canvas) now that native libs are present
-RUN npm rebuild canvas
 
 # Build the frontend and backend (Vite + esbuild)
 RUN npm run build
