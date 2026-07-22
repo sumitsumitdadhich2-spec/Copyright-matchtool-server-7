@@ -126,41 +126,52 @@ function precompute(fps: FPData[]): PreSet {
 // Per-pair similarity helpers
 // ---------------------------------------------------------------------------
 
-/** Fast similarity using only the 'full' variant (for brute-force scan). */
-function hashSimFull(
+/**
+ * Fast pre-filter for the O(n×m) brute-force scan.
+ * Compares the short frame's 'full' variant against ALL movie frame variants and
+ * returns the best similarity. This catches aspect-ratio mismatches where the
+ * short clip's full frame matches a crop/zoom variant of the movie frame
+ * (e.g. 720×720 short vs 968×720 movie → short 'full' ≈ movie 'crop_9_16_2').
+ */
+function hashSimFastCross(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
 ): number {
   const svIdx = sSet.variantIdx.get('full') ?? 0;
-  const mvIdx = mSet.variantIdx.get('full') ?? 0;
-  const sOff = (si * sSet.numVariants + svIdx) * 8;
-  const mOff = (mi * mSet.numVariants + mvIdx) * 8;
-  const h = hammingAt(sSet.hashFlat, sOff, mSet.hashFlat, mOff);
-  return (1 - h / 256) * 100;
+  const sOff  = (si * sSet.numVariants + svIdx) * 8;
+  const mBase = mi * mSet.numVariants;
+  let best = 0;
+  for (let vi = 0; vi < mSet.numVariants; vi++) {
+    const mOff = (mBase + vi) * 8;
+    const sim = (1 - hammingAt(sSet.hashFlat, sOff, mSet.hashFlat, mOff) / 256) * 100;
+    if (sim > best) best = sim;
+  }
+  return best;
 }
 
 /**
- * Best-of-13-same-name hash similarity.
- * For each variant present in both sets (same name), compute Hamming similarity
- * and return the maximum. Handles crop/zoom scenarios.
+ * Full cross-comparison: ALL short frame variants × ALL movie frame variants.
+ * Returns the maximum similarity across every combination.
+ *
+ * This is equivalent to the old browser version's getFrameSimilarity() which
+ * tried every short-crop against every movie-crop. Critical for matching
+ * content that differs in aspect ratio, zoom level, or pan/crop treatment
+ * between the reference movie and the target clip.
  */
-function hashSimBest(
+function hashSimBestCross(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
 ): number {
-  let best = 0;
   const sBase = si * sSet.numVariants;
   const mBase = mi * mSet.numVariants;
-
-  for (const name of sSet.variantNames) {
-    const svIdx = sSet.variantIdx.get(name);
-    const mvIdx = mSet.variantIdx.get(name);
-    if (svIdx === undefined || mvIdx === undefined) continue;
-
-    const sOff = (sBase + svIdx) * 8;
-    const mOff = (mBase + mvIdx) * 8;
-    const sim = (1 - hammingAt(sSet.hashFlat, sOff, mSet.hashFlat, mOff) / 256) * 100;
-    if (sim > best) best = sim;
+  let best = 0;
+  for (let svi = 0; svi < sSet.numVariants; svi++) {
+    const sOff = (sBase + svi) * 8;
+    for (let mvi = 0; mvi < mSet.numVariants; mvi++) {
+      const mOff = (mBase + mvi) * 8;
+      const sim = (1 - hammingAt(sSet.hashFlat, sOff, mSet.hashFlat, mOff) / 256) * 100;
+      if (sim > best) best = sim;
+    }
   }
   return best;
 }
@@ -210,13 +221,13 @@ function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
 
 /**
  * Weighted frame similarity:
- *   84% structural hash (best-of-13 variants) + 16% signature (if available)
+ *   84% structural hash (best cross-variant match) + 16% signature (if available)
  */
 function frameSim(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
 ): number {
-  const hSim = hashSimBest(sSet, si, mSet, mi);
+  const hSim = hashSimBestCross(sSet, si, mSet, mi);
 
   const sSig = sSet.fps[si].signature;
   const mSig = mSet.fps[mi].signature;
@@ -277,19 +288,21 @@ export async function groundMatchedSegments(
       const yp = yieldIfNeeded(si);
       if (yp) await yp;
 
-      // ---- Brute-force scan: find best matching movie frame (full variant only) ----
+      // ---- Brute-force scan: find best matching movie frame ----
+      // Uses short 'full' vs ALL movie variants so aspect-ratio / crop mismatches
+      // are caught here rather than silently rejected.
       let bestMi = -1;
-      let bestFullSim = 0;
+      let bestFastSim = 0;
       for (let mi = 0; mi < movieFps.length; mi++) {
-        const sim = hashSimFull(sSet, si, mSet, mi);
-        if (sim > bestFullSim) {
-          bestFullSim = sim;
+        const sim = hashSimFastCross(sSet, si, mSet, mi);
+        if (sim > bestFastSim) {
+          bestFastSim = sim;
           bestMi = mi;
         }
       }
 
-      // Quick-reject before the more expensive full similarity check
-      if (bestFullSim < passMinSim - 10 || bestMi < 0) continue;
+      // Quick-reject before the more expensive full cross-variant check
+      if (bestFastSim < passMinSim - 10 || bestMi < 0) continue;
 
       // ---- Verify with weighted full similarity (hash + signature) ----
       const startSim = frameSim(sSet, si, mSet, bestMi);
