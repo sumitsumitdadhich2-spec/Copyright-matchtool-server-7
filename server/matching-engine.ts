@@ -1,36 +1,14 @@
 /**
- * Server-side video matching engine — v3 (accuracy-focused)
+ * Server-side video matching engine — v4 (accuracy-focused + frame-drift)
  *
- * Improvements over v2:
- *  1. Multi-hash similarity: average hash (aHash) is now combined with a
- *     gradient/difference hash (dHash). Gradient sign is invariant to
- *     brightness / contrast / gamma / color-grading edits, so heavily
- *     re-graded clips still score high.
- *  2. Mirror / horizontal-flip detection: every comparison also checks the
- *     flipped hashes (fhash / fdhash). Mirrored edits match transparently.
- *  3. Speed-change tolerant walk: the walk continuously estimates the local
- *     slope (movie frames per short frame) via regression over the recent
- *     match sequence, so 0.5x–3x speed-ramped edits stay locked instead of
- *     drifting out of the search window.
- *  4. Multi-candidate seeding: instead of walking only from the single best
- *     movie frame (which fails when the best frame is a false positive such
- *     as a dark/flat frame), the top distinct candidate positions are all
- *     tried and the longest / strongest resulting segment wins.
- *  5. Temporal-motion similarity: per-frame color-delta vectors (computed
- *     from the stored signatures) are compared with cosine similarity. Motion
- *     patterns survive color grading, overlays and crops, adding a third
- *     independent evidence channel.
- *  6. Normalized signature comparison: colorGrid values are z-score
- *     normalized per channel before comparison, so global tint / exposure
- *     shifts no longer poison the signature score.
- *  7. Wider gap tolerance (1s @ 25fps) with a search window that widens as
- *     the gap grows, surviving stickers, transitions, and text overlays.
- *  8. Backward compatible: fingerprints without dhash/fhash still work
- *     (aHash-only path), so old stored results don't crash.
- *
- * Retained from v2: bidirectional walk, scene-cut isolation, adaptive
- * threshold relaxation, three-pass structure with forced coverage, overlap
- * dedup, and unmatchedRanges reporting.
+ * v4 additions over v3:
+ *  1. User-configurable frameDrift: expands the per-step search window so clips
+ *     with minor frame drops, duplicated frames, or slight speed drift stay locked.
+ *  2. Lower WALK_MIN_SIM (50 vs 56) — catches lightly-encoded or low-contrast matches
+ *     that v3 missed, while the segment-quality gate still filters false positives.
+ *  3. More seed candidates (8 vs 6) and a wider fast-floor margin (−20 vs −18).
+ *  4. FrameDetail per segment: reports which crop region matched best and a
+ *     four-channel similarity breakdown (structure / color / character / detail).
  */
 
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
@@ -38,6 +16,23 @@ import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+export interface FrameDetail {
+  /** Human-readable name of the crop region that produced the best match */
+  cropRegion: string;
+  /** Hash-based (structural) similarity 0–100 — 84 % weight in final score */
+  structureSim: number;
+  /** Normalized colorGrid similarity 0–100 */
+  colorSim: number;
+  /** SkinScoreGrid similarity 0–100 (human / character presence) */
+  skinSim: number;
+  /** DetailGrid (edge / texture) similarity 0–100 */
+  detailSim: number;
+  /** 256-bit aHash of the best-matching movie frame (full variant), binary string */
+  movieHash: string;
+  /** 256-bit aHash of the best-matching short frame (full variant), binary string */
+  shortHash: string;
+}
 
 export interface FPData {
   frameIndex: number;
@@ -56,12 +51,13 @@ export interface MatchedSegment {
   isApproximate: boolean;
   /** Short-clip frames skipped due to low confidence within this segment */
   gapCount: number;
-  /** True when the segment matched against horizontally flipped movie hashes */
   matchSequence: Array<{
     shortTime: number;
     movieTime: number;
     similarity: number;
   }>;
+  /** Per-channel similarity breakdown for the best-matching frame in this segment */
+  bestFrameDetail?: FrameDetail;
 }
 
 export interface MatchResult {
@@ -79,14 +75,14 @@ const LOOK_AHEAD = 25;
 
 /**
  * Base half-width of the movie-frame search window during the walk.
- * It widens by +1 per consecutive missed frame (up to WALK_LOOK_AHEAD_MAX)
- * because position uncertainty grows during gaps.
+ * Extended by frameDrift (user param) + missCount (per missed frame),
+ * capped at WALK_LOOK_AHEAD_MAX.
  */
-const WALK_LOOK_AHEAD = 7;
+const WALK_LOOK_AHEAD     = 7;
 const WALK_LOOK_AHEAD_MAX = 18;
 
-/** Base minimum similarity (%) for a frame to extend the segment walk */
-const WALK_MIN_SIM = 56;
+/** Base minimum similarity (%) for a frame to extend the segment walk (v4: 50 vs 56) */
+const WALK_MIN_SIM = 50;
 
 /**
  * How many consecutive low-confidence short frames we tolerate before ending
@@ -98,10 +94,10 @@ const GAP_LOOKAHEAD = 25;
 /** Relax WALK_MIN_SIM by this many % per 25 matched frames */
 const ADAPTIVE_DROP_PER_STEP = 1;
 const ADAPTIVE_STEP_FRAMES   = 25;
-const ADAPTIVE_FLOOR         = 44;
+const ADAPTIVE_FLOOR         = 40;
 
-/** Multi-candidate seeding */
-const MAX_SEED_CANDIDATES = 6;
+/** Multi-candidate seeding (v4: 8 candidates vs 6) */
+const MAX_SEED_CANDIDATES = 8;
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 
@@ -245,11 +241,6 @@ function precompute(fps: FPData[]): PreSet {
 // Per-pair similarity helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Similarity of one short variant vs one movie variant, 0–100.
- * Combines aHash + dHash (when available) and takes the max of the
- * normal-orientation and flipped-orientation scores.
- */
 function pairSim(
   sSet: PreSet, si: number, svi: number,
   mSet: PreSet, mi: number, mvi: number
@@ -273,7 +264,6 @@ function pairSim(
 
   let best = normal;
 
-  // Flip check: short (normal) vs movie (flipped) covers mirror edits
   if (mSet.faFlat !== null && sSet.aBits === mSet.aBits) {
     const faSim = 1 - hammingN(sSet.aFlat, sAOff, mSet.faFlat, mAOff, aWords) / sSet.aBits;
     let flip = faSim;
@@ -290,10 +280,6 @@ function pairSim(
   return best * 100;
 }
 
-/**
- * Fast pre-filter: short 'full' variant vs ALL movie variants.
- * Used in the O(n×m) brute-force seed scan.
- */
 function hashSimFastCross(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
@@ -307,10 +293,6 @@ function hashSimFastCross(
   return best;
 }
 
-/**
- * Full cross-comparison: ALL short variants × ALL movie variants.
- * Returns the maximum similarity across every combination.
- */
 function hashSimBestCross(
   sSet: PreSet, si: number,
   mSet: PreSet, mi: number
@@ -349,7 +331,6 @@ function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
   let total = 0, count = 0;
 
   if (sig1.colorGrid.length === 48 && sig2.colorGrid.length === 48) {
-    // Normalized comparison — robust to global tint / exposure / grading shifts
     const z1 = normalizeColorGrid(sig1.colorGrid);
     const z2 = normalizeColorGrid(sig2.colorGrid);
     let diff = 0;
@@ -383,18 +364,13 @@ function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
   return count > 0 ? (total / count) * 100 : 50;
 }
 
-/**
- * Temporal-motion similarity via cosine of color-delta vectors, 0–100.
- * Returns -1 when unavailable (missing signatures or first frame).
- * Motion patterns survive color grading, overlays, and crops.
- */
 function temporalSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
   if (!sSet.tDelta || !mSet.tDelta || si === 0 || mi === 0) return -1;
   const magS = sSet.tMag![si];
   const magM = mSet.tMag![mi];
   const STATIC = 6;
-  if (magS < STATIC && magM < STATIC) return 78; // both static — mild agreement
-  if (magS < STATIC || magM < STATIC) return 38; // one moving, one static — disagreement
+  if (magS < STATIC && magM < STATIC) return 78;
+  if (magS < STATIC || magM < STATIC) return 38;
   let dot = 0;
   const so = si * 48, mo = mi * 48;
   for (let k = 0; k < 48; k++) dot += sSet.tDelta[so + k] * mSet.tDelta[mo + k];
@@ -402,10 +378,6 @@ function temporalSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number
   return ((cos + 1) / 2) * 100;
 }
 
-/**
- * Weighted frame similarity combining structural hashes, spatial signature,
- * and temporal motion — three independent evidence channels.
- */
 function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
   const hSim = hashSimBestCross(sSet, si, mSet, mi);
   const sSig = sSet.fps[si].signature;
@@ -421,6 +393,98 @@ function frameSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Frame detail helpers (v4 — per-channel breakdown for the best-match frame)
+// ---------------------------------------------------------------------------
+
+function formatCropName(name: string): string {
+  if (name === 'full')               return 'Full Frame';
+  if (name === 'zoom_2_0_center')    return 'Zoom 2.0x Center';
+  if (name === 'zoom_1_5_center')    return 'Zoom 1.5x Center';
+  if (name === 'zoom_1_5_left')      return 'Zoom 1.5x Left';
+  if (name === 'zoom_1_5_right')     return 'Zoom 1.5x Right';
+  if (name === 'zoom_1_25_center')   return 'Zoom 1.25x Center';
+  if (name === 'zoom_1_25_left')     return 'Zoom 1.25x Left';
+  if (name === 'zoom_1_25_right')    return 'Zoom 1.25x Right';
+  if (name.startsWith('crop_9_16_')) {
+    const idx = parseInt(name.split('_').pop() ?? '0', 10);
+    return `9:16 Crop ${idx + 1}`;
+  }
+  return name;
+}
+
+/**
+ * Compute per-channel similarity breakdown for the given frame pair
+ * plus identify which crop region produced the best structural match.
+ */
+function getFrameDetail(sSet: PreSet, si: number, mSet: PreSet, mi: number): FrameDetail {
+  // ── Best crop region ──
+  let bestVariantSim = 0;
+  let bestMovieVariant = 'full';
+  for (let svi = 0; svi < sSet.numVariants; svi++) {
+    for (let mvi = 0; mvi < mSet.numVariants; mvi++) {
+      const sim = pairSim(sSet, si, svi, mSet, mi, mvi);
+      if (sim > bestVariantSim) {
+        bestVariantSim = sim;
+        bestMovieVariant = mSet.variantNames[mvi];
+      }
+    }
+  }
+
+  // ── Structure sim (hash-based, 0–100) ──
+  const structureSim = hashSimBestCross(sSet, si, mSet, mi);
+
+  // ── Signature-based breakdown ──
+  const sSig = sSet.fps[si].signature;
+  const mSig = mSet.fps[mi].signature;
+  let colorSim = 50, skinSim = 50, detailSim = 50;
+
+  if (sSig && mSig) {
+    // Color grid — normalized
+    if (sSig.colorGrid.length === 48 && mSig.colorGrid.length === 48) {
+      const z1 = normalizeColorGrid(sSig.colorGrid);
+      const z2 = normalizeColorGrid(mSig.colorGrid);
+      let diff = 0;
+      for (let i = 0; i < 48; i++) diff += Math.abs(z1[i] - z2[i]);
+      colorSim = Math.max(0, Math.min(100, (1 - diff / 48 / 2) * 100));
+    }
+
+    // Skin grid
+    if (sSig.skinScoreGrid.length > 0 && sSig.skinScoreGrid.length === mSig.skinScoreGrid.length) {
+      let diff = 0;
+      for (let i = 0; i < sSig.skinScoreGrid.length; i++)
+        diff += Math.abs(sSig.skinScoreGrid[i] - mSig.skinScoreGrid[i]);
+      skinSim = Math.max(0, Math.min(100, (1 - diff / sSig.skinScoreGrid.length) * 100));
+    }
+
+    // Detail grid
+    if (sSig.detailGrid.length > 0 && sSig.detailGrid.length === mSig.detailGrid.length) {
+      let maxVal = 1;
+      for (let i = 0; i < sSig.detailGrid.length; i++) {
+        if (sSig.detailGrid[i] > maxVal) maxVal = sSig.detailGrid[i];
+        if (mSig.detailGrid[i] > maxVal) maxVal = mSig.detailGrid[i];
+      }
+      let diff = 0;
+      for (let i = 0; i < sSig.detailGrid.length; i++)
+        diff += Math.abs(sSig.detailGrid[i] - mSig.detailGrid[i]) / maxVal;
+      detailSim = Math.max(0, Math.min(100, (1 - diff / sSig.detailGrid.length) * 100));
+    }
+  }
+
+  const movieHash = mSet.fps[mi].variants['full']?.hash ?? mSet.fps[mi].variants[mSet.variantNames[0]]?.hash ?? '';
+  const shortHash = sSet.fps[si].variants['full']?.hash ?? sSet.fps[si].variants[sSet.variantNames[0]]?.hash ?? '';
+
+  return {
+    cropRegion: formatCropName(bestMovieVariant),
+    structureSim,
+    colorSim,
+    skinSim,
+    detailSim,
+    movieHash,
+    shortHash,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Yield helper
 // ---------------------------------------------------------------------------
 function yieldIfNeeded(iter: number, every = 400): Promise<void> | null {
@@ -431,10 +495,6 @@ function yieldIfNeeded(iter: number, every = 400): Promise<void> | null {
 // Scene-cut detection (short-clip only)
 // ---------------------------------------------------------------------------
 
-/**
- * Compare two consecutive frames WITHIN sSet (for scene-cut detection).
- * Uses the 'full' variant aHash only for speed. Returns similarity 0–100.
- */
 function shortConsecutiveSim(sSet: PreSet, si: number): number {
   const svIdx = sSet.variantIdx.get('full') ?? 0;
   const aWords = sSet.aWords;
@@ -443,10 +503,6 @@ function shortConsecutiveSim(sSet: PreSet, si: number): number {
   return (1 - hammingN(sSet.aFlat, off1, sSet.aFlat, off2, aWords) / sSet.aBits) * 100;
 }
 
-/**
- * Detect hard cuts in the short clip.
- * isCut[si] = 1  →  si is the FIRST frame of a new scene (hard cut before it).
- */
 function detectSceneCuts(sSet: PreSet, threshold = 45): Uint8Array {
   const isCut = new Uint8Array(sSet.fps.length);
   for (let si = 1; si < sSet.fps.length; si++) {
@@ -458,17 +514,12 @@ function detectSceneCuts(sSet: PreSet, threshold = 45): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// Directional walk (forward OR backward) with speed-ratio tracking
+// Directional walk with speed-ratio tracking + frameDrift
 // ---------------------------------------------------------------------------
 
 interface RawSeq { si: number; mi: number; sim: number }
 
-/**
- * Estimate the local slope (movie frames advanced per short frame) from the
- * tail of the current sequence. Handles speed-ramped edits (0.33x–3x).
- */
 function estimateSlope(seq: RawSeq[], seedSi: number, seedMi: number): number {
-  // Use up to the last 25 entries plus the seed as anchors
   const pts: Array<{ si: number; mi: number }> = [{ si: seedSi, mi: seedMi }];
   const start = Math.max(0, seq.length - 25);
   for (let i = start; i < seq.length; i++) pts.push({ si: seq[i].si, mi: seq[i].mi });
@@ -487,14 +538,8 @@ function estimateSlope(seq: RawSeq[], seedSi: number, seedMi: number): number {
 }
 
 /**
- * Walk away from (startSi, startMi) in one direction through the short clip.
- *
- * v3 changes:
- *  - expectedMi is anchored on the LAST GOOD match and projected using the
- *    estimated slope, so speed-changed edits stay locked.
- *  - The search window widens with consecutive misses (position uncertainty
- *    grows during gaps), capped at WALK_LOOK_AHEAD_MAX.
- *  - GAP_LOOKAHEAD raised to 25 frames (1 s) for overlay/transition survival.
+ * Walk away from (startSi, startMi) in one direction.
+ * frameDrift widens the base search window to absorb small frame drops/duplicates.
  */
 function walkOneDir(
   sSet: PreSet,
@@ -503,7 +548,8 @@ function walkOneDir(
   startMi: number,
   usedShort: Uint8Array,
   direction: 1 | -1,
-  isCut: Uint8Array
+  isCut: Uint8Array,
+  frameDrift: number
 ): RawSeq[] {
   const seq: RawSeq[] = [];
   let lastGoodSi = startSi;
@@ -518,22 +564,20 @@ function walkOneDir(
     direction === 1 ? nextSi < limit : nextSi > limit;
     nextSi += direction
   ) {
-    if (usedShort[nextSi]) break; // collide with an already-accepted segment
+    if (usedShort[nextSi]) break;
 
-    // Stop at scene cuts — each scene must become its own segment.
     if (direction === 1  && isCut[nextSi])     break;
     if (direction === -1 && isCut[nextSi + 1]) break;
 
-    // Relax threshold as segment grows (encoding noise tolerance)
     const adaptiveMin = Math.max(
       ADAPTIVE_FLOOR,
       WALK_MIN_SIM - Math.floor(seq.length / ADAPTIVE_STEP_FRAMES) * ADAPTIVE_DROP_PER_STEP
     );
 
-    // Project expected movie position using the estimated speed ratio,
-    // anchored on the last confirmed match (robust across gaps).
     const expectedMi = lastGoodMi + Math.round(slope * (nextSi - lastGoodSi));
-    const half = Math.min(WALK_LOOK_AHEAD_MAX, WALK_LOOK_AHEAD + missCount);
+    // Base window = WALK_LOOK_AHEAD + frameDrift; grows with missCount
+    const baseHalf = Math.min(WALK_LOOK_AHEAD_MAX, WALK_LOOK_AHEAD + frameDrift + missCount);
+    const half = Math.min(WALK_LOOK_AHEAD_MAX, baseHalf);
     const lo = Math.max(0, expectedMi - half);
     const hi = Math.min(mSet.fps.length - 1, expectedMi + half);
     if (lo > hi) break;
@@ -545,7 +589,6 @@ function walkOneDir(
     }
 
     if (best >= adaptiveMin && bestMi >= 0) {
-      // Good frame found — include it, reset gap counter, refresh slope
       seq.push({ si: nextSi, mi: bestMi, sim: best });
       lastGoodSi = nextSi;
       lastGoodMi = bestMi;
@@ -571,19 +614,18 @@ function buildSegment(
   seedMi: number,
   seedSim: number,
   usedShort: Uint8Array,
-  isCut: Uint8Array
+  isCut: Uint8Array,
+  frameDrift: number
 ): RawSeq[] {
-  const backwardSeq = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort, -1, isCut);
-  const forwardSeq  = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort,  1, isCut);
+  const backwardSeq = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort, -1, isCut, frameDrift);
+  const forwardSeq  = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort,  1, isCut, frameDrift);
 
-  // Backward seq is in descending si order → reverse to get ascending
   backwardSeq.reverse();
-
   return [...backwardSeq, { si: seedSi, mi: seedMi, sim: seedSim }, ...forwardSeq];
 }
 
 // ---------------------------------------------------------------------------
-// Compute unmatched short-clip ranges from usedShort flags
+// Compute unmatched short-clip ranges
 // ---------------------------------------------------------------------------
 
 function computeUnmatched(
@@ -611,19 +653,35 @@ function computeUnmatched(
 }
 
 // ---------------------------------------------------------------------------
-// Accept a raw sequence as a MatchedSegment
+// Accept a raw sequence as a MatchedSegment (with optional frame detail)
 // ---------------------------------------------------------------------------
 
-function acceptSegment(seq: RawSeq[], shortFps: FPData[], movieFps: FPData[], isApproximate: boolean): MatchedSegment {
+function acceptSegment(
+  seq: RawSeq[],
+  shortFps: FPData[],
+  movieFps: FPData[],
+  isApproximate: boolean,
+  sSet?: PreSet,
+  mSet?: PreSet
+): MatchedSegment {
   const avgConf = seq.reduce((s, f) => s + f.sim, 0) / seq.length;
 
-  // Count gap frames: short indices inside [first.si, last.si] not in seq
   const firstSi = seq[0].si;
   const lastSi  = seq[seq.length - 1].si;
   const inSeq   = new Set(seq.map(f => f.si));
   let gapCount  = 0;
   for (let g = firstSi + 1; g < lastSi; g++) {
     if (!inSeq.has(g)) gapCount++;
+  }
+
+  // Find best frame for detail computation
+  let bestFrameDetail: FrameDetail | undefined;
+  if (sSet && mSet) {
+    let bestSim = -1, bestSi = seq[0].si, bestMi = seq[0].mi;
+    for (const f of seq) {
+      if (f.sim > bestSim) { bestSim = f.sim; bestSi = f.si; bestMi = f.mi; }
+    }
+    bestFrameDetail = getFrameDetail(sSet, bestSi, mSet, bestMi);
   }
 
   return {
@@ -639,7 +697,8 @@ function acceptSegment(seq: RawSeq[], shortFps: FPData[], movieFps: FPData[], is
       shortTime: shortFps[f.si].timestamp,
       movieTime: movieFps[f.mi].timestamp,
       similarity: f.sim
-    }))
+    })),
+    bestFrameDetail
   };
 }
 
@@ -651,23 +710,25 @@ function acceptSegment(seq: RawSeq[], shortFps: FPData[], movieFps: FPData[], is
  * Find ALL matched segments of shortFps inside movieFps.
  *
  * Three passes:
- *  Pass 1 – High confidence  (≥ minSimilarity, default 82 %)
+ *  Pass 1 – High confidence  (≥ minSimilarity)
  *  Pass 2 – Approximate      (≥ 40 %)
  *  Pass 3 – Forced best-match (no threshold — guarantees full clip coverage)
  *
- * @returns { segments, unmatchedRanges }
+ * @param frameDrift  Extra frames to add to the base walk search window (default 3).
+ *                    Raise to 5–8 when clips have minor frame drops or slight speed drift.
  */
 export async function groundMatchedSegments(
   shortFps: FPData[],
   movieFps: FPData[],
   minSimilarity = 82,
-  minConsecutiveFrames = 9
+  minConsecutiveFrames = 9,
+  frameDrift = 3
 ): Promise<MatchResult> {
   if (shortFps.length === 0 || movieFps.length === 0) {
     return { segments: [], unmatchedRanges: [] };
   }
 
-  console.log(`[Matcher] Precomputing hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames…`);
+  console.log(`[Matcher] Precomputing hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames… (frameDrift=${frameDrift})`);
   const sSet = precompute(shortFps);
   const mSet = precompute(movieFps);
 
@@ -676,11 +737,10 @@ export async function groundMatchedSegments(
   const tEnabled    = sSet.tDelta !== null && mSet.tDelta !== null;
   console.log(`[Matcher] Feature channels: dHash=${dEnabled ? 'on' : 'off'} flipDetect=${flipEnabled ? 'on' : 'off'} temporalMotion=${tEnabled ? 'on' : 'off'}`);
 
-  // Detect hard scene cuts in the short clip so the walk never bridges them.
   const isCut   = detectSceneCuts(sSet);
   const numCuts = isCut.reduce((n, v) => n + v, 0);
   if (numCuts > 0) {
-    console.log(`[Matcher] Detected ${numCuts} scene cut(s) in short clip — each scene will be matched independently.`);
+    console.log(`[Matcher] Detected ${numCuts} scene cut(s) in short clip.`);
   }
 
   console.log('[Matcher] Precompute done. Starting three-pass scan…');
@@ -689,12 +749,12 @@ export async function groundMatchedSegments(
   const segments: MatchedSegment[] = [];
 
   // ------------------------------------------------------------------
-  // Passes 1 & 2: brute-force multi-candidate seed scan + bidirectional walk
+  // Passes 1 & 2
   // ------------------------------------------------------------------
   for (let pass = 1; pass <= 2; pass++) {
-    const passMinSim  = pass === 1 ? minSimilarity : 40;
-    const isApprox    = pass === 2;
-    let   passCount   = 0;
+    const passMinSim = pass === 1 ? minSimilarity : 40;
+    const isApprox   = pass === 2;
+    let   passCount  = 0;
 
     for (let si = 0; si < shortFps.length; si++) {
       if (usedShort[si]) continue;
@@ -702,10 +762,8 @@ export async function groundMatchedSegments(
       const yp = yieldIfNeeded(si);
       if (yp) await yp;
 
-      // ---- Brute-force O(n×m): collect top DISTINCT candidate positions ----
-      // Candidates within SEED_SEPARATION movie frames are merged (local max),
-      // so we get up to MAX_SEED_CANDIDATES genuinely different locations.
-      const fastFloor = passMinSim - 18;
+      // v4: wider fast floor (−20 vs −18) catches more weak candidates
+      const fastFloor = passMinSim - 20;
       const cands: Array<{ mi: number; sim: number }> = [];
       let lastCand: { mi: number; sim: number } | null = null;
 
@@ -724,23 +782,19 @@ export async function groundMatchedSegments(
       cands.sort((a, b) => b.sim - a.sim);
       const topCands = cands.slice(0, MAX_SEED_CANDIDATES);
 
-      // Quick-reject before the more expensive full checks
-      if (topCands[0].sim < passMinSim - 15) continue;
+      if (topCands[0].sim < passMinSim - 18) continue;
 
-      // ---- Try a bidirectional walk from EACH candidate; keep the best ----
       let bestSeq: RawSeq[] | null = null;
       let bestSeqConf = 0;
 
       for (const cand of topCands) {
-        // Verify with full weighted similarity (hash + signature + motion)
         const seedSim = frameSim(sSet, si, mSet, cand.mi);
         if (seedSim < passMinSim) continue;
 
-        const seq = buildSegment(sSet, mSet, si, cand.mi, seedSim, usedShort, isCut);
+        const seq = buildSegment(sSet, mSet, si, cand.mi, seedSim, usedShort, isCut, frameDrift);
         if (seq.length < minConsecutiveFrames) continue;
 
         const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
-        // Prefer longer segments; tie-break on confidence
         if (
           bestSeq === null ||
           seq.length > bestSeq.length ||
@@ -753,10 +807,8 @@ export async function groundMatchedSegments(
 
       if (!bestSeq) continue;
 
-      // Accept — mark all short frames in this sequence as used
       for (const item of bestSeq) usedShort[item.si] = 1;
-
-      segments.push(acceptSegment(bestSeq, shortFps, movieFps, isApprox));
+      segments.push(acceptSegment(bestSeq, shortFps, movieFps, isApprox, sSet, mSet));
       passCount++;
     }
 
@@ -764,18 +816,16 @@ export async function groundMatchedSegments(
   }
 
   // ------------------------------------------------------------------
-  // Pass 3: forced best-match — ensures no clip portion goes unmatched
+  // Pass 3: forced best-match
   // ------------------------------------------------------------------
-  // Collect still-unmatched short frame indices
   const remaining: number[] = [];
   for (let si = 0; si < shortFps.length; si++) {
     if (!usedShort[si]) remaining.push(si);
   }
 
   if (remaining.length >= minConsecutiveFrames) {
-    console.log(`[Matcher] Pass 3 (forced): ${remaining.length} unmatched short frames, finding best movie positions…`);
+    console.log(`[Matcher] Pass 3 (forced): ${remaining.length} unmatched short frames…`);
 
-    // For each remaining frame find its globally best movie match (no threshold)
     const bestOf: Array<{ si: number; mi: number; sim: number }> = [];
     for (let k = 0; k < remaining.length; k++) {
       const si = remaining[k];
@@ -791,7 +841,6 @@ export async function groundMatchedSegments(
       bestOf.push({ si, mi: bestMi, sim: bestSim });
     }
 
-    // Group consecutive si values whose best movie matches are roughly in-sequence
     let k = 0;
     while (k < bestOf.length) {
       const group: typeof bestOf = [bestOf[k]];
@@ -799,9 +848,7 @@ export async function groundMatchedSegments(
 
       for (let j = k + 1; j < bestOf.length; j++) {
         const item = bestOf[j];
-        // Never merge across a scene cut — each scene must be its own segment
         if (isCut[item.si]) break;
-        // Gap in si indices between item and predecessor (already-matched frames between them)
         const siGap      = item.si - bestOf[j - 1].si;
         const expectedMi = curMi + siGap;
         if (Math.abs(item.mi - expectedMi) <= LOOK_AHEAD * 2) {
@@ -814,7 +861,7 @@ export async function groundMatchedSegments(
 
       if (group.length >= minConsecutiveFrames) {
         for (const item of group) usedShort[item.si] = 1;
-        segments.push(acceptSegment(group, shortFps, movieFps, true));
+        segments.push(acceptSegment(group, shortFps, movieFps, true, sSet, mSet));
         console.log(`[Matcher] Pass 3 forced segment: ${group.length} frames`);
       }
 
@@ -823,8 +870,7 @@ export async function groundMatchedSegments(
   }
 
   // ------------------------------------------------------------------
-  // Deduplication: keep highest-confidence segment when short-clip
-  // overlap exceeds 0.15 s
+  // Deduplication
   // ------------------------------------------------------------------
   segments.sort((a, b) => b.confidence - a.confidence);
 
@@ -838,10 +884,8 @@ export async function groundMatchedSegments(
     if (!overlaps) final.push(seg);
   }
 
-  // Sort by clip timeline for display
   final.sort((a, b) => a.shortStart - b.shortStart);
 
-  // Recompute usedShort from accepted segments only (for unmatched range calc).
   const tToSi = new Map<string, number>();
   shortFps.forEach((fp, si) => tToSi.set(fp.timestamp.toFixed(4), si));
 

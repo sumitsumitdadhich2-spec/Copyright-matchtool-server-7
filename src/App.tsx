@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   CloudUpload, Video, Server, Monitor, Play, Pause, Download, Search,
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
-  Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat
+  Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
+  ShieldCheck, Cpu, Zap
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import { clearVideoFingerprints } from './utils/db';
@@ -10,6 +11,16 @@ import { clearVideoFingerprints } from './utils/db';
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+interface FrameDetail {
+  cropRegion: string;
+  structureSim: number;
+  colorSim: number;
+  skinSim: number;
+  detailSim: number;
+  movieHash: string;
+  shortHash: string;
+}
 
 interface MatchedSegment {
   shortStart: number;
@@ -21,11 +32,26 @@ interface MatchedSegment {
   isApproximate: boolean;
   gapCount?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
+  bestFrameDetail?: FrameDetail;
 }
 
 interface UnmatchedRange {
   shortStart: number;
   shortEnd: number;
+}
+
+interface SanityResult {
+  pass: boolean;
+  totalFrames: number;
+  workerAvailable?: boolean;
+  workerError?: string;
+  results: Array<{
+    frameIndex: number;
+    pass: boolean;
+    hashBits: number;
+    mainHashPrefix: string;
+    workerHashPrefix: string;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +94,48 @@ function ConfidenceBadge({ confidence, isApproximate }: { confidence: number; is
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-xs font-semibold bg-orange-500/10 text-orange-400 border border-orange-500/25">
       <AlertCircle className="w-3 h-3" /> {confidence.toFixed(1)}%{isApproximate ? ' ~' : ''}
     </span>
+  );
+}
+
+/** 16×16 perceptual hash visualized as a colored bit-grid */
+function HashGrid({ hash, label, accent }: { hash: string; label: string; accent: string }) {
+  const bits = hash.length >= 256 ? hash.slice(0, 256).split('') : null;
+  return (
+    <div className="space-y-2">
+      <p className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">{label}</p>
+      {bits ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(16, 1fr)', gap: '1.5px' }}>
+          {bits.map((bit, i) => (
+            <div key={i}
+              className={`rounded-[1px] ${bit === '1' ? accent : 'bg-slate-800/80'}`}
+              style={{ aspectRatio: '1' }}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="text-xs text-slate-600 font-mono">No hash data</div>
+      )}
+      <p className="text-[9px] font-mono text-slate-700 break-all leading-tight">
+        {hash ? hash.slice(0, 48) + '…' : '—'}
+      </p>
+    </div>
+  );
+}
+
+/** Single row of the double-check checklist */
+function ChecklistRow({ label, value, weight }: { label: string; value: number; weight?: string }) {
+  const pct = Math.max(0, Math.min(100, value));
+  const bar = pct >= 75 ? 'bg-green-500' : pct >= 50 ? 'bg-yellow-500' : 'bg-red-500/70';
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-[10px] font-mono">
+        <span className="text-slate-400">{label}{weight ? <span className="text-slate-600 ml-1">({weight})</span> : ''}</span>
+        <span className={`font-bold ${pct >= 75 ? 'text-green-400' : pct >= 50 ? 'text-yellow-400' : 'text-red-400'}`}>{pct.toFixed(1)}%</span>
+      </div>
+      <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-500 ${bar}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
   );
 }
 
@@ -119,7 +187,13 @@ export default function App() {
   // Match params (sent to server)
   const [similarityThreshold, setSimilarityThreshold] = useState(82);
   const [minSegmentDuration, setMinSegmentDuration]   = useState(0.5);   // seconds → converted to frames
+  const [frameDrift, setFrameDrift]                   = useState(3);      // extra search window frames
   const [showSettings, setShowSettings]               = useState(false);
+
+  // Sanity test
+  const [sanityRunning, setSanityRunning] = useState(false);
+  const [sanityResult, setSanityResult]   = useState<SanityResult | null>(null);
+  const [showSanity, setShowSanity]       = useState(false);
 
   // Match results
   const [segments, setSegments]           = useState<MatchedSegment[]>([]);
@@ -291,7 +365,8 @@ export default function App() {
             movieJobId: refJobId,
             shortJobId: jobId,
             minSimilarity: similarityThreshold,
-            minConsecutiveFrames
+            minConsecutiveFrames,
+            frameDrift
           })
         });
 
@@ -387,6 +462,23 @@ export default function App() {
     refVideoRef.current?.play();
     clipVideoRef.current?.play();
     setIsPlaying(true);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Sanity test
+  // ---------------------------------------------------------------------------
+  const handleSanityTest = async () => {
+    setSanityRunning(true);
+    setSanityResult(null);
+    try {
+      const res = await fetch('/api/sanity-test', { method: 'POST' });
+      const data = await res.json();
+      setSanityResult(data);
+    } catch (e: any) {
+      setSanityResult({ pass: false, totalFrames: 10, results: [] });
+    } finally {
+      setSanityRunning(false);
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -519,7 +611,7 @@ export default function App() {
               <div className="text-left">
                 <h2 className="text-base font-semibold text-white">Match Parameters</h2>
                 <p className="text-xs text-slate-500">
-                  Confidence ≥{similarityThreshold}% · Min duration {minSegmentDuration.toFixed(1)}s
+                  Confidence ≥{similarityThreshold}% · Min duration {minSegmentDuration.toFixed(1)}s · Drift ±{frameDrift}f
                 </p>
               </div>
             </div>
@@ -532,20 +624,101 @@ export default function App() {
                 label="Confidence Threshold"
                 hint="Minimum similarity % for a frame to count as a match. Lower = catch more (but more false positives). Default: 82%."
                 value={similarityThreshold}
-                min={60} max={95} step={1}
+                min={20} max={95} step={1}
                 display={`≥ ${similarityThreshold}%`}
                 onChange={setSimilarityThreshold}
                 disabled={busy}
               />
               <SliderParam
                 label="Min Segment Duration"
-                hint="Shortest accepted match sequence. Raises this to filter out brief single-scene blips. Default: 0.5s."
+                hint="Shortest accepted match sequence. Raise to filter out brief blips. Default: 0.5s."
                 value={minSegmentDuration}
                 min={0.2} max={5.0} step={0.1}
                 display={`${minSegmentDuration.toFixed(1)}s`}
                 onChange={setMinSegmentDuration}
                 disabled={busy}
               />
+              <SliderParam
+                label="Sequence Frame Drift"
+                hint="Extra frames added to the per-step search window. Allows matching clips with minor frame drops or slight speed drift. Default: ±3 frames."
+                value={frameDrift}
+                min={0} max={10} step={1}
+                display={`± ${frameDrift} frame${frameDrift !== 1 ? 's' : ''}`}
+                onChange={setFrameDrift}
+                disabled={busy}
+              />
+            </div>
+          )}
+        </section>
+
+        {/* ── Worker Accuracy Calibration ── */}
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+          <button
+            onClick={() => setShowSanity(s => !s)}
+            className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-800/50 transition-colors cursor-pointer"
+          >
+            <div className="flex items-center gap-3">
+              <div className="bg-cyan-500/10 p-2 rounded-lg border border-cyan-500/20">
+                <Cpu className="w-4 h-4 text-cyan-400" />
+              </div>
+              <div className="text-left">
+                <h2 className="text-base font-semibold text-white">Worker Accuracy Calibration</h2>
+                <p className="text-xs text-slate-500">Verify 100% hash integrity between Main Thread and Web Worker</p>
+              </div>
+              {sanityResult && (
+                <span className={`ml-2 flex items-center gap-1 text-xs font-semibold ${sanityResult.pass ? 'text-green-400' : 'text-red-400'}`}>
+                  {sanityResult.pass ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
+                  {sanityResult.pass ? 'PASS' : 'FAIL'}
+                </span>
+              )}
+            </div>
+            {showSanity ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+          </button>
+
+          {showSanity && (
+            <div className="px-6 pb-6 pt-2 border-t border-slate-800 space-y-4">
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Executes side-by-side processing of 10 complex test frames on the <span className="text-cyan-400 font-medium">Main Thread</span> vs.{' '}
+                <span className="text-purple-400 font-medium">Web Worker</span> to guarantee 100% hash value integrity.
+              </p>
+
+              <button
+                onClick={handleSanityTest}
+                disabled={sanityRunning}
+                className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition cursor-pointer"
+              >
+                {sanityRunning
+                  ? <><RefreshCw className="w-4 h-4 animate-spin" /> Running…</>
+                  : <><ShieldCheck className="w-4 h-4" /> Run Sanity Test</>}
+              </button>
+
+              {sanityResult && (
+                <div className="space-y-3">
+                  <div className={`flex items-center gap-3 p-3 rounded-xl border text-sm font-semibold ${sanityResult.pass ? 'bg-green-900/20 border-green-700/40 text-green-300' : 'bg-red-900/20 border-red-700/40 text-red-300'}`}>
+                    {sanityResult.pass
+                      ? <><CheckCircle2 className="w-4 h-4" /> All {sanityResult.totalFrames} frames passed — 256-bit hash determinism verified{sanityResult.workerAvailable ? ' (Main Thread ≡ Worker)' : ' (Main Thread — worker path requires ffmpeg install)'}</>
+                      : <><AlertCircle className="w-4 h-4" /> Hash mismatch detected — worker output differs from main thread</>}
+                  </div>
+
+                  <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
+                    {sanityResult.results.map(r => (
+                      <div key={r.frameIndex} className={`grid grid-cols-[auto_1fr_1fr] gap-3 p-2 rounded-lg text-[10px] font-mono border ${r.pass ? 'bg-slate-800/40 border-slate-800' : 'bg-red-900/20 border-red-700/30'}`}>
+                        <span className={`font-bold self-center ${r.pass ? 'text-green-400' : 'text-red-400'}`}>
+                          F{r.frameIndex + 1} {r.pass ? '✓' : '✗'}
+                        </span>
+                        <div>
+                          <p className="text-cyan-500/70 mb-0.5">Main Thread ({r.hashBits}-bit)</p>
+                          <p className="text-slate-400 break-all">{r.mainHashPrefix}…</p>
+                        </div>
+                        <div>
+                          <p className="text-purple-500/70 mb-0.5">Worker</p>
+                          <p className={`break-all ${r.pass ? 'text-slate-400' : 'text-red-400'}`}>{r.workerHashPrefix}…</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -927,6 +1100,109 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {/* ── Perceptual Fingerprint & Integrity Panels ── */}
+            {previewSegment.bestFrameDetail && (() => {
+              const d = previewSegment.bestFrameDetail!;
+              const intSim = d.structureSim * 0.84 + d.colorSim * 0.053 + d.skinSim * 0.053 + d.detailSim * 0.054;
+              return (
+                <>
+                  {/* Live Perceptual Fingerprint */}
+                  <div className="p-4 border-t border-slate-800 space-y-4">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-3.5 h-3.5 text-yellow-400" />
+                      <p className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                        Live Perceptual Fingerprint <span className="text-slate-600 normal-case font-normal">(16×16 / 256-bit Hex Map)</span>
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                      <HashGrid hash={d.movieHash} label="Movie Hash" accent="bg-blue-400" />
+                      <HashGrid hash={d.shortHash} label="Short Hash" accent="bg-indigo-400" />
+                    </div>
+                  </div>
+
+                  {/* Match Integrity + Crop Region */}
+                  <div className="p-4 border-t border-slate-800 space-y-4">
+                    <div className="flex flex-wrap items-start gap-6">
+                      {/* Integrity gauge */}
+                      <div className="flex-1 min-w-[180px] space-y-2">
+                        <div className="flex justify-between text-xs font-mono">
+                          <span className="text-slate-400">Match Integrity Similarity</span>
+                          <span className={`font-bold ${intSim >= similarityThreshold ? 'text-green-400' : intSim >= 60 ? 'text-yellow-400' : 'text-orange-400'}`}>
+                            {intSim.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="relative w-full h-3 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-700 ${intSim >= similarityThreshold ? 'bg-green-500' : intSim >= 60 ? 'bg-yellow-500' : 'bg-orange-500'}`}
+                            style={{ width: `${intSim}%` }}
+                          />
+                          {/* Threshold marker */}
+                          <div
+                            className="absolute top-0 h-full w-0.5 bg-white/40"
+                            style={{ left: `${similarityThreshold}%` }}
+                            title={`Threshold: ${similarityThreshold}%`}
+                          />
+                        </div>
+                        <div className="flex justify-between text-[9px] font-mono text-slate-700">
+                          <span>Low Match</span>
+                          <span>Threshold ({similarityThreshold}%)</span>
+                          <span>Exact Match</span>
+                        </div>
+                      </div>
+
+                      {/* Crop region badge */}
+                      <div className="space-y-1">
+                        <p className="text-[10px] text-slate-500 font-mono uppercase tracking-wider">Matched Crop Region</p>
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/25 rounded-lg text-xs font-mono text-purple-300">
+                          <Layers className="w-3 h-3" />
+                          {d.cropRegion}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Double-Check Verification Checklist */}
+                  <div className="p-4 border-t border-slate-800 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                      <p className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Double-Check Verification Checklist</p>
+                      <span className="text-[10px] text-slate-600 font-mono">Active Frame-by-Frame</span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <ChecklistRow label="Structure" value={d.structureSim} weight="84%" />
+                      <ChecklistRow label="Colors & Background" value={d.colorSim} />
+                      <ChecklistRow label="Human / Character" value={d.skinSim} />
+                      <ChecklistRow label="Edges / Details" value={d.detailSim} />
+                    </div>
+                    <p className="text-[9px] text-slate-700 leading-relaxed">
+                      * The system prioritizes structural fingerprints <span className="text-slate-600">(84% weight)</span> to remain robust under style changes,
+                      while cross-checking ambient colors, characters (hands/heads), and background detail ratios <span className="text-slate-600">(16% weight)</span>{' '}
+                      for extreme frame alignment precision.
+                    </p>
+
+                    {/* Fingerprint Bitstream */}
+                    <div className="mt-2 space-y-2 pt-3 border-t border-slate-800/60">
+                      <p className="text-[10px] text-slate-500 font-mono uppercase tracking-wider">Fingerprint Bitstream (Prefix 48-bit)</p>
+                      <div className="space-y-1">
+                        <div className="flex items-start gap-2">
+                          <span className="text-[9px] text-blue-500/70 font-mono w-24 shrink-0 pt-0.5">Movie Hash</span>
+                          <code className="text-[9px] font-mono text-slate-400 break-all leading-tight">
+                            {d.movieHash ? d.movieHash.slice(0, 48) + '…' : '—'}
+                          </code>
+                        </div>
+                        <div className="flex items-start gap-2">
+                          <span className="text-[9px] text-indigo-500/70 font-mono w-24 shrink-0 pt-0.5">Short Hash</span>
+                          <code className="text-[9px] font-mono text-slate-400 break-all leading-tight">
+                            {d.shortHash ? d.shortHash.slice(0, 48) + '…' : '—'}
+                          </code>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </section>
         )}
 

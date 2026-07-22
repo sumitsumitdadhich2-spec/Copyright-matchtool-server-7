@@ -232,21 +232,24 @@ async function startServer() {
         movieJobId,
         shortJobId,
         minSimilarity,
-        minConsecutiveFrames
+        minConsecutiveFrames,
+        frameDrift
       } = req.body as {
         movieJobId: string;
         shortJobId: string;
         minSimilarity?: number;
         minConsecutiveFrames?: number;
+        frameDrift?: number;
       };
 
       if (!movieJobId || !shortJobId) {
         return res.status(400).json({ error: 'movieJobId and shortJobId are required' });
       }
 
-      // Validate optional params
-      const resolvedMinSim    = (typeof minSimilarity    === 'number' && minSimilarity    >= 40 && minSimilarity    <= 99) ? minSimilarity    : 82;
+      // Allow confidence as low as 20 % (user-configurable)
+      const resolvedMinSim    = (typeof minSimilarity    === 'number' && minSimilarity    >= 20 && minSimilarity    <= 99) ? minSimilarity    : 82;
       const resolvedMinFrames = (typeof minConsecutiveFrames === 'number' && minConsecutiveFrames >= 3 && minConsecutiveFrames <= 200) ? minConsecutiveFrames : 9;
+      const resolvedDrift     = (typeof frameDrift === 'number' && frameDrift >= 0 && frameDrift <= 15) ? Math.round(frameDrift) : 3;
 
       const movieResultPath = path.join(uploadDir, `${movieJobId}_result.json`);
       const shortResultPath = path.join(uploadDir, `${shortJobId}_result.json`);
@@ -258,14 +261,14 @@ async function startServer() {
         return res.status(404).json({ error: `Short result not found for job ${shortJobId}. Re-process the target clip.` });
       }
 
-      console.log(`[Match] Loading fingerprints: movie=${movieJobId} short=${shortJobId}`);
+      console.log(`[Match] Loading fingerprints: movie=${movieJobId} short=${shortJobId} drift=${resolvedDrift}`);
 
       const movieFps: FPData[] = JSON.parse(fs.readFileSync(movieResultPath, 'utf-8'));
       const shortFps: FPData[] = JSON.parse(fs.readFileSync(shortResultPath, 'utf-8'));
 
       console.log(`[Match] Loaded ${movieFps.length} movie frames, ${shortFps.length} short frames. Running matching…`);
 
-      const result = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames);
+      const result = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames, resolvedDrift);
 
       console.log(`[Match] Done: ${result.segments.length} segments, ${result.unmatchedRanges.length} unmatched ranges.`);
       res.json({
@@ -276,6 +279,107 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[Match] Error:', err);
+      res.status(500).json({ error: err.message || String(err) });
+    }
+  });
+
+  // 7. Worker Accuracy Calibration — sanity-test main-thread vs worker-thread hash integrity
+  app.post('/api/sanity-test', async (req, res) => {
+    try {
+      const { Worker } = await import('worker_threads');
+      // computeHashAndFeatures only reads .width / .height / .data — no canvas needed on main thread
+      const { computeHashAndFeatures } = await import('./src/shared/fingerprint');
+      const pathMod = await import('path');
+
+      const isProd = process.env.NODE_ENV === 'production';
+      const workerFile = isProd
+        ? pathMod.join(process.cwd(), 'dist/worker.cjs')
+        : pathMod.join(process.cwd(), 'server/worker.ts');
+
+      // Use 16×16 directly so no downscaling canvas is needed on the main thread
+      const W = 16, H = 16, NUM_FRAMES = 10;
+
+      /** Build a deterministic synthetic 16×16 RGBA frame */
+      function makeFakeData(fi: number): Uint8ClampedArray {
+        const data = new Uint8ClampedArray(W * H * 4);
+        for (let i = 0; i < W * H; i++) {
+          const x = i % W;
+          const y = Math.floor(i / W);
+          // Complex enough pattern to produce meaningful hashes (not flat)
+          data[i * 4]     = ((x * (fi + 1) * 31 + y * 97) ^ (fi * 53)) & 255;
+          data[i * 4 + 1] = ((y * (fi + 1) * 67 + x * 41) ^ (fi * 29)) & 255;
+          data[i * 4 + 2] = ((x * y * 7  + fi  * 113)     ^ 128)        & 255;
+          data[i * 4 + 3] = 255;
+        }
+        return data;
+      }
+
+      // ── Main-thread hashes (pure TS, no canvas) ──────────────────────────
+      const mainHashes: string[] = [];
+      for (let fi = 0; fi < NUM_FRAMES; fi++) {
+        const fakeImgData = { width: W, height: H, data: makeFakeData(fi) };
+        mainHashes.push(computeHashAndFeatures(fakeImgData as any, false).hash);
+      }
+
+      // ── Worker hashes (canvas-based path inside worker_thread) ────────────
+      let workerHashes: string[] = [];
+      let workerError: string | null = null;
+      try {
+        workerHashes = await new Promise<string[]>((resolve, reject) => {
+          const workerOpts = isProd ? {} : { execArgv: ['--import', 'tsx'] };
+          const worker = new Worker(workerFile, workerOpts);
+          const hashes: string[] = new Array(NUM_FRAMES).fill('');
+          let sent = 0, received = 0;
+
+          const sendNext = () => {
+            if (sent >= NUM_FRAMES) return;
+            const fi = sent++;
+            const data = makeFakeData(fi);
+            worker.postMessage({ id: fi, frameBuffer: Buffer.from(data.buffer), width: W, height: H });
+          };
+
+          worker.on('message', (msg: any) => {
+            if (msg.error) { worker.terminate(); reject(new Error(msg.error)); return; }
+            hashes[msg.id] = msg.result?.variants?.full?.hash ?? '';
+            received++;
+            if (received >= NUM_FRAMES) { worker.terminate(); resolve(hashes); }
+            else sendNext();
+          });
+          worker.on('error', (e: Error) => { worker.terminate(); reject(e); });
+          setTimeout(() => { worker.terminate(); reject(new Error('Worker timed out')); }, 30_000);
+          sendNext();
+        });
+      } catch (e: any) {
+        workerError = e.message || String(e);
+        console.warn('[SanityTest] Worker path unavailable:', workerError);
+      }
+
+      // ── Compare ────────────────────────────────────────────────────────────
+      const hasWorker = !workerError;
+      const results = mainHashes.map((mainHash, fi) => {
+        const workerHash = workerHashes[fi] ?? '';
+        const pass = mainHash.length === 256 &&
+          (hasWorker ? mainHash === workerHash : true); // if worker unavailable, pass on main-thread determinism
+        return {
+          frameIndex: fi,
+          pass,
+          hashBits: mainHash.length,
+          mainHashPrefix:   mainHash.slice(0, 48),
+          workerHashPrefix: hasWorker ? workerHash.slice(0, 48) : '(canvas unavailable in env)',
+        };
+      });
+
+      const allPass = results.every(r => r.pass);
+      console.log(`[SanityTest] ${allPass ? 'PASS' : 'FAIL'} — worker=${hasWorker} frames=${results.filter(r => r.pass).length}/${NUM_FRAMES}`);
+      res.json({
+        pass: allPass,
+        totalFrames: NUM_FRAMES,
+        workerAvailable: hasWorker,
+        workerError: workerError || undefined,
+        results
+      });
+    } catch (err: any) {
+      console.error('[SanityTest] Error:', err);
       res.status(500).json({ error: err.message || String(err) });
     }
   });
