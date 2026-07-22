@@ -1,404 +1,563 @@
-import React, { useState, useRef } from 'react';
-import { CloudUpload, Video, Server, Monitor, Play, Download, Search, FileJson, Film, CircleCheck, ScanLine, Activity } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  CloudUpload, Video, Server, Monitor, Play, Pause, Download, Search,
+  Film, CircleCheck, ScanLine, Activity, ChevronRight, X, AlertCircle,
+  CheckCircle2, Clock, Layers
+} from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
-import { loadAllReferenceFingerprints, findBestMatch, MatchResult, compareFingerprints } from './Matcher';
 import { clearVideoFingerprints } from './utils/db';
-import { FrameFingerprint } from './shared/fingerprint';
 
-const DEFAULT_CUT_LIST = `[
-  { "startTimeSeconds": 10, "frames": 50 },
-  { "startTimeSeconds": 60, "frames": 100 }
-]`;
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface MatchedSegment {
+  shortStart: number;
+  shortEnd: number;
+  movieStart: number;
+  movieEnd: number;
+  confidence: number;
+  frameCount: number;
+  isApproximate: boolean;
+  matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
+}
+
+// ---------------------------------------------------------------------------
+// Helper components
+// ---------------------------------------------------------------------------
+
+function ConfidenceBadge({ confidence, isApproximate }: { confidence: number; isApproximate: boolean }) {
+  const isHigh = !isApproximate && confidence >= 80;
+  const isMed  = !isApproximate && confidence >= 60 && confidence < 80;
+
+  if (isHigh) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-mono text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/25">
+        <CheckCircle2 className="w-3 h-3" />
+        {confidence.toFixed(1)}%
+      </span>
+    );
+  }
+  if (isMed) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-mono text-xs font-semibold bg-yellow-500/10 text-yellow-400 border border-yellow-500/25">
+        <AlertCircle className="w-3 h-3" />
+        {confidence.toFixed(1)}%
+      </span>
+    );
+  }
+  // Approximate or low confidence
+  return (
+    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-mono text-xs font-semibold bg-orange-500/10 text-orange-400 border border-orange-500/25">
+      <AlertCircle className="w-3 h-3" />
+      {confidence.toFixed(1)}% {isApproximate ? '~' : ''}
+    </span>
+  );
+}
+
+function fmt(secs: number) {
+  const m = Math.floor(secs / 60);
+  const s = (secs % 60).toFixed(2).padStart(5, '0');
+  return `${m}:${s}`;
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 
 export default function App() {
   const [processMode, setProcessMode] = useState<'browser' | 'server'>('server');
+
+  // Reference video state
   const [refFile, setRefFile] = useState<File | null>(null);
-  const [targetFile, setTargetFile] = useState<File | null>(null);
   const [refFileUrl, setRefFileUrl] = useState<string>('');
-  
-  const [refProgress, setRefProgress] = useState({ processed: 0, total: 0, inflight: 0, startTime: 0 });
-  const [targetProgress, setTargetProgress] = useState({ processed: 0, total: 0, inflight: 0, startTime: 0 });
-  
+  const [refJobId, setRefJobId] = useState<string>('');
+  const [refProgress, setRefProgress] = useState({ processed: 0, total: 0, startTime: 0 });
+  const [refDone, setRefDone] = useState(false);
   const [refBatches, setRefBatches] = useState(0);
-  
-  const [cutListJson, setCutListJson] = useState(DEFAULT_CUT_LIST);
-  const [matches, setMatches] = useState<MatchResult[]>([]);
+
+  // Target clip state
+  const [targetFile, setTargetFile] = useState<File | null>(null);
+  const [targetFileUrl, setTargetFileUrl] = useState<string>('');
+  const [targetJobId, setTargetJobId] = useState<string>('');
+  const [targetProgress, setTargetProgress] = useState({ processed: 0, total: 0, startTime: 0 });
+  const [targetDone, setTargetDone] = useState(false);
+
+  // Match state
+  const [segments, setSegments] = useState<MatchedSegment[]>([]);
+  const [isMatching, setIsMatching] = useState(false);
+  const [matchStats, setMatchStats] = useState<{ movieFrames: number; shortFrames: number } | null>(null);
+
+  // Status / error
   const [status, setStatus] = useState<string>('');
-  
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const [errorMsg, setErrorMsg] = useState<string>('');
+
+  // Processing in-flight
+  const [isProcessingRef, setIsProcessingRef] = useState(false);
+  const [isProcessingTarget, setIsProcessingTarget] = useState(false);
+
+  // Preview panel
+  const [previewSegment, setPreviewSegment] = useState<MatchedSegment | null>(null);
+  const refVideoRef   = useRef<HTMLVideoElement>(null);
+  const clipVideoRef  = useRef<HTMLVideoElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  // Clean up blob URLs on unmount
+  useEffect(() => {
+    return () => {
+      if (refFileUrl) URL.revokeObjectURL(refFileUrl);
+      if (targetFileUrl) URL.revokeObjectURL(targetFileUrl);
+    };
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // File handlers
+  // ---------------------------------------------------------------------------
 
   const handleRefFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     setRefFile(file);
-    if (file) {
-      setRefFileUrl(URL.createObjectURL(file));
-    }
+    setRefDone(false);
+    setRefJobId('');
+    setSegments([]);
+    setMatchStats(null);
+    if (refFileUrl) URL.revokeObjectURL(refFileUrl);
+    if (file) setRefFileUrl(URL.createObjectURL(file));
+    else setRefFileUrl('');
   };
+
+  const handleTargetFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] || null;
+    setTargetFile(file);
+    setTargetDone(false);
+    setTargetJobId('');
+    setSegments([]);
+    setMatchStats(null);
+    if (targetFileUrl) URL.revokeObjectURL(targetFileUrl);
+    if (file) setTargetFileUrl(URL.createObjectURL(file));
+    else setTargetFileUrl('');
+  };
+
+  // ---------------------------------------------------------------------------
+  // Process reference
+  // ---------------------------------------------------------------------------
 
   const handleProcessReference = async () => {
     if (!refFile) return;
-    console.log("[DEBUG] handleProcessReference: starting for file:", refFile.name, "size:", refFile.size, "mode:", processMode);
-    setStatus(`Processing reference video (${processMode === 'server' ? 'on Server' : 'in Browser'})...`);
+    setIsProcessingRef(true);
+    setRefDone(false);
+    setRefJobId('');
+    setErrorMsg('');
+    setStatus(`Processing reference video${processMode === 'server' ? ' on server' : ' in browser'}…`);
+
     try {
-      console.log("[DEBUG] handleProcessReference: clearing db");
       await clearVideoFingerprints('reference');
-      console.log("[DEBUG] handleProcessReference: db cleared, calling extraction pipeline");
-      
       const startTime = performance.now();
-      const runProcessor = processMode === 'server' ? processVideoOnServer : processVideoFile;
-      
-      const { totalFrames, batches } = await runProcessor(refFile, 'reference', (p, t, i) => {
-        setRefProgress({ processed: p, total: t, inflight: i, startTime });
+      const run = processMode === 'server' ? processVideoOnServer : processVideoFile;
+
+      const { totalFrames, batches, jobId } = await run(refFile, 'reference', (p, t) => {
+        setRefProgress({ processed: p, total: t, startTime });
       });
-      console.log("[DEBUG] Loading reference fingerprints to set window.allFingerprints");
-      const refFps = await loadAllReferenceFingerprints('reference', batches);
-      (window as any).allFingerprints = refFps;
-      console.log(`[DEBUG] Set window.allFingerprints with ${refFps.length} items`);
 
       setRefBatches(batches);
-      setStatus(`Reference video processed: ${totalFrames} frames in ${batches} batches.`);
-      console.log("[DEBUG] handleProcessReference: processing finished successfully!");
+      setRefJobId(jobId || '');
+      setRefDone(true);
+      setStatus(`Reference processed: ${totalFrames} frames.`);
     } catch (e: any) {
-      console.error("[DEBUG] handleProcessReference error:", e);
-      setStatus(`Error: ${e.message}`);
+      setErrorMsg(`Reference error: ${e.message}`);
+      setStatus('');
+    } finally {
+      setIsProcessingRef(false);
     }
   };
 
-  const handleRunMatching = async () => {
+  // ---------------------------------------------------------------------------
+  // Process target + match (server mode) or just match (browser mode)
+  // ---------------------------------------------------------------------------
+
+  const handleRunAnalysis = async () => {
     if (!targetFile) return;
+    setIsProcessingTarget(true);
+    setIsMatching(false);
+    setSegments([]);
+    setMatchStats(null);
+    setErrorMsg('');
+    setStatus(`Processing target clip${processMode === 'server' ? ' on server' : ' in browser'}…`);
+
     try {
-      setStatus('Loading reference fingerprints from DB...');
-      const refFps = await loadAllReferenceFingerprints('reference', refBatches);
-      
-      setStatus(`Extracting target fingerprints (${processMode === 'server' ? 'on Server' : 'in Browser'})...`);
       await clearVideoFingerprints('target');
-      
       const startTime = performance.now();
-      const runProcessor = processMode === 'server' ? processVideoOnServer : processVideoFile;
-      
-      const { batches: targetBatches } = await runProcessor(targetFile, 'target', (p, t, i) => {
-        setTargetProgress({ processed: p, total: t, inflight: i, startTime });
+      const run = processMode === 'server' ? processVideoOnServer : processVideoFile;
+
+      const { totalFrames, batches, jobId } = await run(targetFile, 'target', (p, t) => {
+        setTargetProgress({ processed: p, total: t, startTime });
       });
-      
-      setStatus('Target fingerprints extracted. Matching...');
-      const targetFps = await loadAllReferenceFingerprints('target', targetBatches);
-      
-      let cuts: { startTimeSeconds: number; frames: number }[] = [];
-      try {
-        cuts = JSON.parse(cutListJson);
-      } catch (e) {
-        // ignore parse error if empty
-      }
-      if (!cuts || cuts.length === 0) {
-        // default to matching the whole target clip as one cut
-        cuts = [{ startTimeSeconds: 0, frames: targetFps.length }];
-      }
 
-      const results: MatchResult[] = [];
-      
-      for (let i = 0; i < cuts.length; i++) {
-        const cut = cuts[i];
-        // Find start frame
-        const startFrameIndex = targetFps.findIndex(f => f.timestamp >= cut.startTimeSeconds);
-        if (startFrameIndex === -1) continue;
-        
-        const startFp = targetFps[startFrameIndex];
-        const verifyFp = targetFps[Math.min(targetFps.length - 1, startFrameIndex + 5)]; // secondary verify frame
-        const endFp = targetFps[Math.min(targetFps.length - 1, startFrameIndex + cut.frames - 1)]; // last frame
-        
-        const { bestIndex, bestSim: startSim } = findBestMatch(startFp, refFps, 10, 30);
-        
-        if (bestIndex !== -1) {
-           let finalConfidence = startSim;
-           let verifiedEndFrameIndex = refFps[Math.min(refFps.length - 1, bestIndex + cut.frames)]?.frameIndex;
-           
-           // Verify secondary frame
-           const refVerifyIndex = Math.min(refFps.length - 1, bestIndex + 5);
-           const verifySim = compareFingerprints(verifyFp, refFps[refVerifyIndex]);
-           
-           let initialConfidence = (startSim + verifySim) / 2;
-           
-           // Verify end frame (search around expected end)
-           const expectedEndIndex = Math.min(refFps.length - 1, bestIndex + cut.frames - 1);
-           const endSearchWindow = 10;
-           let bestEndSim = 0;
-           let bestActualEndIndex = expectedEndIndex;
-           for (let j = Math.max(0, expectedEndIndex - endSearchWindow); j <= Math.min(refFps.length - 1, expectedEndIndex + endSearchWindow); j++) {
-             const sim = compareFingerprints(endFp, refFps[j]);
-             if (sim > bestEndSim) {
-               bestEndSim = sim;
-               bestActualEndIndex = j;
-             }
-           }
-           verifiedEndFrameIndex = refFps[bestActualEndIndex]?.frameIndex;
-           
-           if (initialConfidence >= 90) {
-             // Sample 2-3 additional middle frames
-             const mid1Fp = targetFps[Math.min(targetFps.length - 1, startFrameIndex + Math.floor(cut.frames * 0.33))];
-             const mid2Fp = targetFps[Math.min(targetFps.length - 1, startFrameIndex + Math.floor(cut.frames * 0.66))];
-             
-             const refMid1Index = Math.min(refFps.length - 1, bestIndex + Math.floor(cut.frames * 0.33));
-             const refMid2Index = Math.min(refFps.length - 1, bestIndex + Math.floor(cut.frames * 0.66));
-             
-             const mid1Sim = compareFingerprints(mid1Fp, refFps[refMid1Index]);
-             const mid2Sim = compareFingerprints(mid2Fp, refFps[refMid2Index]);
-             
-             finalConfidence = (startSim + verifySim + bestEndSim + mid1Sim + mid2Sim) / 5;
-           } else {
-             finalConfidence = (startSim + verifySim + bestEndSim) / 3;
-           }
+      setTargetJobId(jobId || '');
+      setTargetDone(true);
+      setIsProcessingTarget(false);
 
-           results.push({
-             cutIndex: i,
-             cutStartTime: cut.startTimeSeconds,
-             cutFrames: cut.frames,
-             refMatchFrameIndex: refFps[bestIndex].frameIndex,
-             refMatchTime: refFps[bestIndex].timestamp,
-             confidence: finalConfidence,
-             verifiedEndFrameIndex: verifiedEndFrameIndex
-           });
+      // ---- Server mode: use /api/match ----
+      if (processMode === 'server') {
+        if (!refJobId) {
+          setErrorMsg('Reference job ID not found — please re-process the reference video in server mode.');
+          return;
         }
+        if (!jobId) {
+          setErrorMsg('Target job ID missing — re-process the target clip.');
+          return;
+        }
+        setIsMatching(true);
+        setStatus(`Fingerprints extracted (${totalFrames} frames). Running segment matching…`);
+
+        const matchRes = await fetch('/api/match', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ movieJobId: refJobId, shortJobId: jobId })
+        });
+
+        if (!matchRes.ok) {
+          const errData = await matchRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Match API returned ${matchRes.status}`);
+        }
+
+        const data = await matchRes.json();
+        setSegments(data.segments || []);
+        setMatchStats({ movieFrames: data.movieFrames, shortFrames: data.shortFrames });
+        setIsMatching(false);
+        setStatus(`Matching complete. ${(data.segments || []).length} segment(s) found.`);
+      } else {
+        // ---- Browser mode: simple sequential scan ----
+        setIsMatching(true);
+        setStatus('Running browser-side matching…');
+
+        const { loadAllReferenceFingerprints, compareFingerprints } = await import('./Matcher');
+        const refFps = await loadAllReferenceFingerprints('reference', refBatches);
+        const targetFps = await loadAllReferenceFingerprints('target', batches);
+
+        // Naive scan: find the best movie start for the whole clip
+        let bestSim = 0;
+        let bestMi = 0;
+        for (let mi = 0; mi < refFps.length; mi += 5) {
+          const sim = compareFingerprints(targetFps[0], refFps[mi]);
+          if (sim > bestSim) { bestSim = sim; bestMi = mi; }
+        }
+
+        const approxSegment: MatchedSegment = {
+          shortStart: targetFps[0]?.timestamp ?? 0,
+          shortEnd:   targetFps[targetFps.length - 1]?.timestamp ?? 0,
+          movieStart: refFps[bestMi]?.timestamp ?? 0,
+          movieEnd:   refFps[Math.min(refFps.length - 1, bestMi + targetFps.length)]?.timestamp ?? 0,
+          confidence: bestSim,
+          frameCount: targetFps.length,
+          isApproximate: true,
+          matchSequence: []
+        };
+        setSegments([approxSegment]);
+        setIsMatching(false);
+        setStatus('Browser matching complete.');
       }
-      
-      setMatches(results);
-      setStatus('Matching complete.');
     } catch (e: any) {
-      setStatus(`Error: ${e.message}`);
+      setErrorMsg(`Error: ${e.message}`);
+      setStatus('');
+      setIsProcessingTarget(false);
+      setIsMatching(false);
     }
   };
 
-  const handlePreviewMatch = (time: number) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = time;
-      videoRef.current.play();
+  // ---------------------------------------------------------------------------
+  // Preview
+  // ---------------------------------------------------------------------------
+
+  const handlePreviewSegment = (seg: MatchedSegment) => {
+    setPreviewSegment(seg);
+    setIsPlaying(false);
+    // Seek both videos after a short delay to let the panel render
+    setTimeout(() => {
+      if (refVideoRef.current) {
+        refVideoRef.current.currentTime = seg.movieStart;
+      }
+      if (clipVideoRef.current) {
+        clipVideoRef.current.currentTime = seg.shortStart;
+      }
+    }, 100);
+  };
+
+  const handleSyncPlay = () => {
+    if (!refVideoRef.current || !clipVideoRef.current) return;
+    if (isPlaying) {
+      refVideoRef.current.pause();
+      clipVideoRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      refVideoRef.current.play();
+      clipVideoRef.current.play();
+      setIsPlaying(true);
     }
   };
+
+  // ---------------------------------------------------------------------------
+  // Download JSON
+  // ---------------------------------------------------------------------------
 
   const handleDownloadJson = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(matches, null, 2));
+    const payload = { segments, matchStats };
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
     const a = document.createElement('a');
     a.href = dataStr;
-    a.download = "match_results.json";
+    a.download = 'match_results.json';
     a.click();
   };
 
-  const renderProgress = (progress: typeof refProgress, isTarget: boolean = false) => {
-    if (progress.total === 0 && progress.processed === 0) return null;
-    const elapsedSecs = (performance.now() - progress.startTime) / 1000;
-    const fps = progress.processed / (elapsedSecs || 1);
-    const remainingFrames = progress.total - progress.processed;
-    const etaSecs = fps > 0 ? remainingFrames / fps : 0;
-    const etaString = isFinite(etaSecs) ? `${Math.round(etaSecs / 60)}m ${Math.round(etaSecs % 60)}s` : '...';
-    const percent = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0;
-    
+  // ---------------------------------------------------------------------------
+  // Progress renderer
+  // ---------------------------------------------------------------------------
+
+  const renderProgress = (prog: typeof refProgress, accent: string) => {
+    if (prog.total === 0 && prog.processed === 0) return null;
+    const elapsed = (performance.now() - prog.startTime) / 1000;
+    const fps = prog.processed / (elapsed || 1);
+    const remaining = prog.total - prog.processed;
+    const eta = fps > 0 ? remaining / fps : 0;
+    const etaStr = isFinite(eta) ? `${Math.floor(eta / 60)}m ${Math.round(eta % 60)}s` : '…';
+    const pct = prog.total > 0 ? Math.min(100, Math.round((prog.processed / prog.total) * 100)) : 0;
     return (
-      <div className="mt-6 space-y-3">
-        <div className="flex justify-between items-end text-sm">
-          <div className="flex flex-col">
-            <span className="text-slate-500 font-medium text-xs uppercase tracking-wider mb-1">Progress</span>
-            <span className="font-mono text-slate-300 font-semibold">{progress.processed} <span className="text-slate-500 font-normal">/ {progress.total || '?'} frames</span></span>
-          </div>
-          <div className="flex flex-col text-right">
-            <span className="text-slate-500 font-medium text-xs uppercase tracking-wider mb-1">Speed & ETA</span>
-            <span className="font-mono text-slate-300 font-semibold">{fps.toFixed(1)} fps <span className="text-slate-500 font-normal mx-1">&middot;</span> {etaString}</span>
-          </div>
+      <div className="mt-4 space-y-2">
+        <div className="flex justify-between text-xs font-mono text-slate-400">
+          <span>{prog.processed.toLocaleString()} / {prog.total ? prog.total.toLocaleString() : '?'} frames</span>
+          <span>{fps.toFixed(1)} fps · ETA {etaStr}</span>
         </div>
-        <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden border border-slate-700/50">
-          <div 
-            className={`h-full transition-all duration-300 ease-out ${isTarget ? 'bg-indigo-500' : 'bg-blue-500'}`} 
-            style={{ width: `${percent}%` }} 
+        <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+          <div
+            className={`h-full transition-all duration-300 ${accent}`}
+            style={{ width: `${pct}%` }}
           />
         </div>
       </div>
     );
   };
 
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  const canRunAnalysis = !!targetFile && refDone && !isProcessingRef && !isProcessingTarget && !isMatching;
+
   return (
-    <div className="min-h-screen bg-[#0f1115] text-slate-300 font-sans selection:bg-blue-500/30">
-      <div className="max-w-5xl mx-auto p-6 md:p-10 space-y-8">
-        
-        {/* Header */}
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 border-b border-slate-800 pb-8">
+    <div className="min-h-screen bg-[#0d1117] text-slate-300 font-sans">
+      <div className="max-w-5xl mx-auto p-6 md:p-10 space-y-6">
+
+        {/* ---- Header ---- */}
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-800 pb-6">
           <div>
-            <h1 className="text-3xl font-bold text-white tracking-tight flex items-center gap-3">
-              <ScanLine className="w-8 h-8 text-blue-500" />
+            <h1 className="text-2xl font-bold text-white flex items-center gap-2.5">
+              <ScanLine className="w-7 h-7 text-blue-500" />
               Nexus Video Match
             </h1>
-            <p className="text-slate-400 mt-2 text-sm">High-performance video fingerprinting & timeline matching</p>
+            <p className="text-slate-500 text-sm mt-1">Sequence-alignment video fingerprint matching</p>
           </div>
-          
-          <div className="flex items-center bg-slate-900 p-1.5 rounded-lg border border-slate-800 shadow-inner">
+
+          {/* Mode toggle */}
+          <div className="flex items-center bg-slate-900 p-1 rounded-lg border border-slate-800">
             <button
               onClick={() => setProcessMode('browser')}
-              className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md transition-all duration-200 cursor-pointer ${processMode === 'browser' ? 'bg-slate-700 text-white shadow-sm ring-1 ring-slate-600' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${processMode === 'browser' ? 'bg-slate-700 text-white shadow ring-1 ring-slate-600' : 'text-slate-400 hover:text-white'}`}
             >
-              <Monitor className="w-4 h-4" />
-              Browser
+              <Monitor className="w-3.5 h-3.5" /> Browser
             </button>
             <button
               onClick={() => setProcessMode('server')}
-              className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md transition-all duration-200 cursor-pointer ${processMode === 'server' ? 'bg-blue-600 text-white shadow-sm ring-1 ring-blue-500 shadow-blue-900/20' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${processMode === 'server' ? 'bg-blue-600 text-white shadow ring-1 ring-blue-500' : 'text-slate-400 hover:text-white'}`}
             >
-              <Server className="w-4 h-4" />
-              Server (64-Core)
+              <Server className="w-3.5 h-3.5" /> Server
             </button>
           </div>
         </div>
-        
-        {/* 1. Reference Movie */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center gap-3 mb-6">
+
+        {/* ---- Error banner ---- */}
+        {errorMsg && (
+          <div className="flex items-start gap-3 bg-red-950/40 border border-red-800/50 rounded-xl p-4 text-red-300 text-sm">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-400" />
+            <span>{errorMsg}</span>
+            <button onClick={() => setErrorMsg('')} className="ml-auto shrink-0 text-red-500 hover:text-red-300 cursor-pointer">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* ---- Step 1: Reference Movie ---- */}
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div className="flex items-center gap-3">
             <div className="bg-blue-500/10 p-2 rounded-lg border border-blue-500/20">
-              <Film className="w-5 h-5 text-blue-400" />
+              <Film className="w-4 h-4 text-blue-400" />
             </div>
-            <h2 className="text-xl font-semibold text-white">Reference Movie</h2>
-          </div>
-          
-          <div className="relative group">
-            <input 
-              type="file" 
-              accept="video/mp4" 
-              onChange={handleRefFileChange} 
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
-            />
-            <div className={`flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl transition-colors duration-200 ${refFile ? 'border-blue-500/50 bg-blue-500/5' : 'border-slate-700 bg-slate-800/50 group-hover:border-slate-600 group-hover:bg-slate-800'}`}>
-              <CloudUpload className={`w-8 h-8 mb-3 ${refFile ? 'text-blue-400' : 'text-slate-500'}`} />
-              <span className="text-sm font-medium text-slate-300">
-                {refFile ? refFile.name : 'Drop reference video here or click to browse'}
+            <div>
+              <h2 className="text-base font-semibold text-white">Step 1 — Reference Movie</h2>
+              <p className="text-xs text-slate-500">The full-length video to search within</p>
+            </div>
+            {refDone && (
+              <span className="ml-auto flex items-center gap-1 text-xs text-green-400 font-medium">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Ready
               </span>
-              <span className="text-xs text-slate-500 mt-1">MP4 format supported</span>
-            </div>
+            )}
           </div>
 
-          <button 
-            onClick={handleProcessReference} 
-            disabled={!refFile}
-            className="mt-6 w-full flex justify-center items-center gap-2 px-4 py-3 bg-blue-600 text-white rounded-xl font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-500 transition-colors shadow-lg shadow-blue-900/20 cursor-pointer"
-          >
-            <Activity className="w-4 h-4" />
-            Extract Fingerprints
-          </button>
-          
-          {renderProgress(refProgress, false)}
-        </div>
-        
-        {/* 2. Target Clip & Match */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="bg-indigo-500/10 p-2 rounded-lg border border-indigo-500/20">
-              <Search className="w-5 h-5 text-indigo-400" />
-            </div>
-            <h2 className="text-xl font-semibold text-white">Target Clip Search</h2>
-          </div>
-
-          <div className="space-y-6">
-            <div className="relative group">
-              <input 
-                type="file" 
-                accept="video/mp4" 
-                onChange={e => setTargetFile(e.target.files?.[0] || null)} 
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
-              />
-              <div className={`flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-xl transition-colors duration-200 ${targetFile ? 'border-indigo-500/50 bg-indigo-500/5' : 'border-slate-700 bg-slate-800/50 group-hover:border-slate-600 group-hover:bg-slate-800'}`}>
-                <CloudUpload className={`w-8 h-8 mb-3 ${targetFile ? 'text-indigo-400' : 'text-slate-500'}`} />
-                <span className="text-sm font-medium text-slate-300">
-                  {targetFile ? targetFile.name : 'Drop target clip to match'}
-                </span>
+          <div className="relative group">
+            <input
+              type="file"
+              accept="video/mp4"
+              onChange={handleRefFileChange}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+            />
+            <div className={`flex items-center gap-3 p-4 border-2 border-dashed rounded-xl transition-colors ${refFile ? 'border-blue-500/40 bg-blue-500/5' : 'border-slate-700 bg-slate-800/40 group-hover:border-slate-600'}`}>
+              <CloudUpload className={`w-5 h-5 shrink-0 ${refFile ? 'text-blue-400' : 'text-slate-500'}`} />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-slate-300 truncate">{refFile ? refFile.name : 'Drop reference video here or click to browse'}</p>
+                {refFile && <p className="text-xs text-slate-500">{(refFile.size / 1024 / 1024).toFixed(1)} MB</p>}
               </div>
             </div>
-            
-            <div>
-              <label className="flex items-center gap-2 text-sm font-medium text-slate-300 mb-2">
-                <FileJson className="w-4 h-4 text-slate-400" />
-                Cut List Definition <span className="text-slate-500 font-normal">(Optional)</span>
-              </label>
-              <textarea 
-                value={cutListJson} 
-                onChange={e => setCutListJson(e.target.value)}
-                placeholder="Leave empty to process whole file as one cut"
-                className="w-full h-24 p-3 bg-slate-950 border border-slate-800 rounded-xl font-mono text-xs text-slate-300 focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500/50 outline-none transition-all resize-none placeholder-slate-700"
-              />
-            </div>
-
-            <button 
-              onClick={handleRunMatching} 
-              disabled={!targetFile || !refBatches}
-              className="w-full flex justify-center items-center gap-2 px-4 py-3 bg-indigo-600 text-white rounded-xl font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-indigo-500 transition-colors shadow-lg shadow-indigo-900/20 cursor-pointer"
-            >
-              <ScanLine className="w-4 h-4" />
-              Run Match Analysis
-            </button>
-
-            {renderProgress(targetProgress, true)}
           </div>
-        </div>
-        
-        {/* Status */}
-        {status && (
-          <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center gap-3 font-mono text-sm text-slate-300 shadow-sm">
-            <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+
+          <button
+            onClick={handleProcessReference}
+            disabled={!refFile || isProcessingRef}
+            className="w-full flex justify-center items-center gap-2 py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-colors cursor-pointer"
+          >
+            <Activity className="w-4 h-4" />
+            {isProcessingRef ? 'Processing…' : 'Extract Fingerprints'}
+          </button>
+
+          {renderProgress(refProgress, 'bg-blue-500')}
+        </section>
+
+        {/* ---- Step 2: Target Clip ---- */}
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-indigo-500/10 p-2 rounded-lg border border-indigo-500/20">
+              <Search className="w-4 h-4 text-indigo-400" />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold text-white">Step 2 — Target Clip & Find Matches</h2>
+              <p className="text-xs text-slate-500">Upload the clip to locate inside the reference</p>
+            </div>
+            {targetDone && (
+              <span className="ml-auto flex items-center gap-1 text-xs text-green-400 font-medium">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Processed
+              </span>
+            )}
+          </div>
+
+          <div className="relative group">
+            <input
+              type="file"
+              accept="video/mp4"
+              onChange={handleTargetFileChange}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+            />
+            <div className={`flex items-center gap-3 p-4 border-2 border-dashed rounded-xl transition-colors ${targetFile ? 'border-indigo-500/40 bg-indigo-500/5' : 'border-slate-700 bg-slate-800/40 group-hover:border-slate-600'}`}>
+              <CloudUpload className={`w-5 h-5 shrink-0 ${targetFile ? 'text-indigo-400' : 'text-slate-500'}`} />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-slate-300 truncate">{targetFile ? targetFile.name : 'Drop target clip here or click to browse'}</p>
+                {targetFile && <p className="text-xs text-slate-500">{(targetFile.size / 1024 / 1024).toFixed(1)} MB</p>}
+              </div>
+            </div>
+          </div>
+
+          {!refDone && targetFile && (
+            <p className="text-xs text-amber-400/80 flex items-center gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5" />
+              Process the reference video first (Step 1).
+            </p>
+          )}
+
+          <button
+            onClick={handleRunAnalysis}
+            disabled={!canRunAnalysis}
+            className="w-full flex justify-center items-center gap-2 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-colors cursor-pointer"
+          >
+            <ScanLine className="w-4 h-4" />
+            {isProcessingTarget ? 'Extracting fingerprints…' : isMatching ? 'Running matching algorithm…' : 'Process & Find Matches'}
+          </button>
+
+          {renderProgress(targetProgress, 'bg-indigo-500')}
+        </section>
+
+        {/* ---- Status bar ---- */}
+        {(status || isMatching) && (
+          <div className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl p-3.5 text-sm text-slate-300">
+            <div className={`w-2 h-2 rounded-full shrink-0 ${isMatching || isProcessingRef || isProcessingTarget ? 'bg-blue-500 animate-pulse' : 'bg-green-500'}`} />
             {status}
           </div>
         )}
-        
-        {/* Results */}
-        {matches.length > 0 && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl overflow-hidden">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+
+        {/* ---- Results ---- */}
+        {segments.length > 0 && (
+          <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+            <div className="p-6 border-b border-slate-800 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
               <div className="flex items-center gap-3">
                 <div className="bg-green-500/10 p-2 rounded-lg border border-green-500/20">
-                  <CircleCheck className="w-5 h-5 text-green-400" />
+                  <Layers className="w-4 h-4 text-green-400" />
                 </div>
-                <h2 className="text-xl font-semibold text-white">Analysis Results</h2>
+                <div>
+                  <h2 className="text-base font-semibold text-white">
+                    {segments.length} Matched Segment{segments.length !== 1 ? 's' : ''}
+                  </h2>
+                  {matchStats && (
+                    <p className="text-xs text-slate-500">
+                      {matchStats.shortFrames} clip frames scanned against {matchStats.movieFrames} movie frames
+                    </p>
+                  )}
+                </div>
               </div>
-              <button 
+              <button
                 onClick={handleDownloadJson}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-slate-200 rounded-lg font-medium hover:bg-slate-700 transition border border-slate-700 text-sm cursor-pointer shadow-sm"
+                className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-lg text-xs font-medium transition cursor-pointer"
               >
-                <Download className="w-4 h-4" />
-                Export JSON
+                <Download className="w-3.5 h-3.5" /> Export JSON
               </button>
             </div>
 
-            {refFileUrl && (
-              <div className="mb-8 rounded-xl overflow-hidden border border-slate-800 bg-black shadow-inner">
-                <video ref={videoRef} src={refFileUrl} controls className="w-full max-h-[400px] object-contain" />
-              </div>
-            )}
-
-            <div className="overflow-x-auto rounded-xl border border-slate-800">
-              <table className="min-w-full text-sm text-left whitespace-nowrap">
-                <thead className="bg-slate-950 text-slate-400 font-medium border-b border-slate-800">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-950 text-slate-500 text-xs font-medium uppercase tracking-wider border-b border-slate-800">
                   <tr>
-                    <th className="px-6 py-4">Cut Index</th>
-                    <th className="px-6 py-4">Target Start</th>
-                    <th className="px-6 py-4">Frames</th>
-                    <th className="px-6 py-4">Match Start</th>
-                    <th className="px-6 py-4">Match End</th>
-                    <th className="px-6 py-4">Confidence</th>
-                    <th className="px-6 py-4 text-right">Action</th>
+                    <th className="px-5 py-3 text-left">#</th>
+                    <th className="px-5 py-3 text-left">Clip Time</th>
+                    <th className="px-5 py-3 text-left">Movie Time</th>
+                    <th className="px-5 py-3 text-left">Duration</th>
+                    <th className="px-5 py-3 text-left">Confidence</th>
+                    <th className="px-5 py-3 text-right">Preview</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-800/50 bg-slate-900/30">
-                  {matches.map((m, i) => (
-                    <tr key={i} className="hover:bg-slate-800/50 transition-colors">
-                      <td className="px-6 py-4 font-mono text-slate-300">{m.cutIndex}</td>
-                      <td className="px-6 py-4 font-mono text-slate-400">{m.cutStartTime.toFixed(2)}s</td>
-                      <td className="px-6 py-4 font-mono text-slate-400">{m.cutFrames}</td>
-                      <td className="px-6 py-4 font-mono text-white font-medium">{m.refMatchTime.toFixed(2)}s</td>
-                      <td className="px-6 py-4 font-mono text-slate-400">{m.verifiedEndFrameIndex !== undefined ? (m.verifiedEndFrameIndex / 25).toFixed(2) : ((m.refMatchFrameIndex + m.cutFrames) / 25).toFixed(2)}s</td>
-                      <td className="px-6 py-4">
-                        <span className={`inline-flex items-center px-2.5 py-1 rounded-md font-mono text-xs font-medium border ${m.confidence >= 90 ? 'bg-green-500/10 text-green-400 border-green-500/20' : m.confidence >= 80 ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
-                          {m.confidence.toFixed(1)}%
-                        </span>
+                <tbody className="divide-y divide-slate-800/60">
+                  {segments.map((seg, i) => (
+                    <tr
+                      key={i}
+                      className={`transition-colors hover:bg-slate-800/40 ${previewSegment === seg ? 'bg-slate-800/60' : ''}`}
+                    >
+                      <td className="px-5 py-3.5 font-mono text-slate-500 text-xs">{i + 1}</td>
+                      <td className="px-5 py-3.5">
+                        <span className="font-mono text-white text-xs">{fmt(seg.shortStart)}</span>
+                        <span className="text-slate-600 mx-1">→</span>
+                        <span className="font-mono text-slate-400 text-xs">{fmt(seg.shortEnd)}</span>
                       </td>
-                      <td className="px-6 py-4 text-right">
+                      <td className="px-5 py-3.5">
+                        <span className="font-mono text-white text-xs">{fmt(seg.movieStart)}</span>
+                        <span className="text-slate-600 mx-1">→</span>
+                        <span className="font-mono text-slate-400 text-xs">{fmt(seg.movieEnd)}</span>
+                      </td>
+                      <td className="px-5 py-3.5 font-mono text-slate-400 text-xs">
+                        {(seg.movieEnd - seg.movieStart).toFixed(1)}s · {seg.frameCount}f
+                      </td>
+                      <td className="px-5 py-3.5">
+                        <ConfidenceBadge confidence={seg.confidence} isApproximate={seg.isApproximate} />
+                      </td>
+                      <td className="px-5 py-3.5 text-right">
                         <button
-                          onClick={() => handlePreviewMatch(m.refMatchTime)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/20 rounded-lg font-medium text-xs transition cursor-pointer"
+                          onClick={() => handlePreviewSegment(seg)}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 text-blue-400 rounded-lg text-xs font-medium transition cursor-pointer"
                         >
-                          <Play className="w-3.5 h-3.5" />
-                          Preview
+                          <Play className="w-3 h-3" /> Preview
                         </button>
                       </td>
                     </tr>
@@ -406,8 +565,117 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+          </section>
+        )}
+
+        {segments.length === 0 && !isMatching && matchStats && (
+          <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-xl p-5 text-slate-400 text-sm">
+            <AlertCircle className="w-5 h-5 text-amber-500 shrink-0" />
+            No matching segments found. Try re-processing with better-quality source videos, or ensure the clip actually appears in the reference.
           </div>
         )}
+
+        {/* ---- Preview Panel ---- */}
+        {previewSegment && (
+          <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
+            <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="bg-blue-500/10 p-1.5 rounded-lg border border-blue-500/20">
+                  <Video className="w-4 h-4 text-blue-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white">Side-by-Side Preview</h3>
+                  <p className="text-xs text-slate-500">
+                    Movie @ {fmt(previewSegment.movieStart)} · Clip @ {fmt(previewSegment.shortStart)} · Confidence {previewSegment.confidence.toFixed(1)}%
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSyncPlay}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium transition cursor-pointer"
+                >
+                  {isPlaying ? <><Pause className="w-3.5 h-3.5" /> Pause Both</> : <><Play className="w-3.5 h-3.5" /> Play Both</>}
+                </button>
+                <button
+                  onClick={() => setPreviewSegment(null)}
+                  className="p-1.5 text-slate-500 hover:text-slate-300 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-0 divide-y md:divide-y-0 md:divide-x divide-slate-800">
+              {/* Reference movie */}
+              <div className="p-4 space-y-2">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Film className="w-3.5 h-3.5 text-blue-400" /> Reference Movie
+                  <span className="font-normal font-mono text-slate-500 normal-case">@ {fmt(previewSegment.movieStart)}</span>
+                </p>
+                <div className="bg-black rounded-xl overflow-hidden border border-slate-800">
+                  {refFileUrl ? (
+                    <video
+                      ref={refVideoRef}
+                      src={refFileUrl}
+                      controls
+                      className="w-full max-h-64 object-contain"
+                      onPlay={() => setIsPlaying(true)}
+                      onPause={() => setIsPlaying(false)}
+                    />
+                  ) : (
+                    <div className="flex items-center justify-center h-40 text-slate-600 text-sm">
+                      Reference video file not available for preview
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Target clip */}
+              <div className="p-4 space-y-2">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Search className="w-3.5 h-3.5 text-indigo-400" /> Target Clip
+                  <span className="font-normal font-mono text-slate-500 normal-case">@ {fmt(previewSegment.shortStart)}</span>
+                </p>
+                <div className="bg-black rounded-xl overflow-hidden border border-slate-800">
+                  {targetFileUrl ? (
+                    <video
+                      ref={clipVideoRef}
+                      src={targetFileUrl}
+                      controls
+                      className="w-full max-h-64 object-contain"
+                      onPlay={() => setIsPlaying(true)}
+                      onPause={() => setIsPlaying(false)}
+                    />
+                  ) : (
+                    <div className="flex items-center justify-center h-40 text-slate-600 text-sm">
+                      Target clip file not available for preview
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Match sequence mini-timeline */}
+            {previewSegment.matchSequence.length > 0 && (
+              <div className="p-4 border-t border-slate-800">
+                <p className="text-xs text-slate-500 mb-2">Match quality timeline ({previewSegment.matchSequence.length} frames)</p>
+                <div className="flex gap-px h-6 rounded overflow-hidden">
+                  {previewSegment.matchSequence.map((item, i) => {
+                    const pct = item.similarity;
+                    const bg = pct >= 80 ? 'bg-green-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
+                    return <div key={i} className={`flex-1 ${bg} opacity-80`} style={{ opacity: pct / 100 }} title={`${item.similarity.toFixed(0)}%`} />;
+                  })}
+                </div>
+                <div className="flex justify-between text-xs text-slate-600 mt-1 font-mono">
+                  <span>{fmt(previewSegment.shortStart)}</span>
+                  <span>{fmt(previewSegment.shortEnd)}</span>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
       </div>
     </div>
   );

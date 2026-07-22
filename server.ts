@@ -6,10 +6,12 @@ import * as path from 'path';
 import * as os from 'os';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
+import { groundMatchedSegments, FPData } from './server/matching-engine';
 
 async function startServer() {
   const app = express();
   app.use(cors());
+  app.use(express.json());
   const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
   // Ensure upload directory exists
@@ -130,7 +132,6 @@ async function startServer() {
     const jobId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     const tempVideoPath = req.file.path;
 
-    // Initialize job status
     const job: Job = {
       id: jobId,
       status: 'pending',
@@ -139,10 +140,8 @@ async function startServer() {
     };
     jobs.set(jobId, job);
 
-    // Return job ID immediately
     res.json({ jobId });
 
-    // Kick off processing in the background
     console.log(`[Job ${jobId}] Starting background processing for ${tempVideoPath}...`);
     job.status = 'processing';
 
@@ -158,7 +157,6 @@ async function startServer() {
       const resultPath = path.join(uploadDir, `${jobId}_result.json`);
       fs.writeFileSync(resultPath, JSON.stringify(results));
 
-      // Cleanup temp video file
       try {
         if (fs.existsSync(tempVideoPath)) {
           fs.unlinkSync(tempVideoPath);
@@ -177,7 +175,6 @@ async function startServer() {
     }).catch((err) => {
       console.error(`[Job ${jobId}] Processing failed:`, err);
       
-      // Cleanup temp video file on failure
       try {
         if (fs.existsSync(tempVideoPath)) {
           fs.unlinkSync(tempVideoPath);
@@ -194,7 +191,7 @@ async function startServer() {
     });
   });
 
-  // 3. Status endpoint
+  // 4. Status endpoint
   app.get('/api/status/:jobId', (req, res) => {
     const { jobId } = req.params;
     const job = jobs.get(jobId);
@@ -204,7 +201,7 @@ async function startServer() {
     res.json(job);
   });
 
-  // 4. Result retrieval endpoint
+  // 5. Result retrieval endpoint
   app.get('/api/result/:jobId', (req, res) => {
     const { jobId } = req.params;
     const job = jobs.get(jobId);
@@ -226,6 +223,42 @@ async function startServer() {
         console.error(`Failed to send result file for job ${jobId}:`, err);
       }
     });
+  });
+
+  // 6. Match endpoint — runs groundMatchedSegments on two stored result JSONs
+  app.post('/api/match', async (req, res) => {
+    try {
+      const { movieJobId, shortJobId } = req.body as { movieJobId: string; shortJobId: string };
+
+      if (!movieJobId || !shortJobId) {
+        return res.status(400).json({ error: 'movieJobId and shortJobId are required' });
+      }
+
+      const movieResultPath = path.join(uploadDir, `${movieJobId}_result.json`);
+      const shortResultPath = path.join(uploadDir, `${shortJobId}_result.json`);
+
+      if (!fs.existsSync(movieResultPath)) {
+        return res.status(404).json({ error: `Movie result not found for job ${movieJobId}. Re-process the reference video.` });
+      }
+      if (!fs.existsSync(shortResultPath)) {
+        return res.status(404).json({ error: `Short result not found for job ${shortJobId}. Re-process the target clip.` });
+      }
+
+      console.log(`[Match] Loading fingerprints: movie=${movieJobId} short=${shortJobId}`);
+
+      const movieFps: FPData[] = JSON.parse(fs.readFileSync(movieResultPath, 'utf-8'));
+      const shortFps: FPData[] = JSON.parse(fs.readFileSync(shortResultPath, 'utf-8'));
+
+      console.log(`[Match] Loaded ${movieFps.length} movie frames, ${shortFps.length} short frames. Running matching…`);
+
+      const segments = await groundMatchedSegments(shortFps, movieFps);
+
+      console.log(`[Match] Done: ${segments.length} segments found.`);
+      res.json({ segments, movieFrames: movieFps.length, shortFrames: shortFps.length });
+    } catch (err: any) {
+      console.error('[Match] Error:', err);
+      res.status(500).json({ error: err.message || String(err) });
+    }
   });
 
   // --- VITE MIDDLEWARE CONFIGURATION ---

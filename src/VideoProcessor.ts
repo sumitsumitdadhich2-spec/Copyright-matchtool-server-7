@@ -89,9 +89,9 @@ export async function processVideoFile(
   file: File,
   videoId: string,
   onProgress: (framesProcessed: number, totalFrames: number, inflight: number) => void
-): Promise<{ totalFrames: number, batches: number }> {
+): Promise<{ totalFrames: number, batches: number, jobId: string }> {
   const mp4boxfile = MP4Box.createFile();
-  let chunkSize = 4096; // Start very small to trigger onReady before sample data is parsed
+  let chunkSize = 4096;
   let offset = 0;
   let trackInfo: any = null;
   const maxInflight = 300;
@@ -170,7 +170,6 @@ export async function processVideoFile(
       decoder = new VideoDecoder({
         output: async (frame) => {
           videoFramesCreated++;
-          // Check inflight bitmaps before creating ImageBitmap
           while (workerPool.inflightBitmaps >= maxInflight) {
             await delay(10);
           }
@@ -182,7 +181,7 @@ export async function processVideoFile(
             const ts = frame.timestamp / 1_000_000;
             const fIndex = framesDispatched++;
             
-            frame.close(); // Close immediately after creating bitmap
+            frame.close();
             videoFramesClosed++;
 
             workerPool.enqueue(bitmap, fIndex, ts).then(fp => {
@@ -201,11 +200,6 @@ export async function processVideoFile(
               if (framesProcessed % 200 === 0) {
                 console.log(`[Diag] Frame ${framesProcessed} - VideoFrames: ${videoFramesCreated} created / ${videoFramesClosed} closed, ImageBitmaps: ${imageBitmapsCreated} created / ${imageBitmapsClosed} closed, inflightBitmaps: ${workerPool.inflightBitmaps}`);
               }
-              if (framesProcessed % 500 === 0) {
-                const perfMem = (performance as any).memory;
-                const heapUsed = perfMem ? `${(perfMem.usedJSHeapSize / (1024 * 1024)).toFixed(2)} MB` : 'N/A';
-                console.log(`[Diag] Frame ${framesProcessed} - Peak JS Heap Size: ${heapUsed}`);
-              }
 
               currentBatch.push(fp);
               if (currentBatch.length >= batchSize) {
@@ -219,7 +213,7 @@ export async function processVideoFile(
                     saveFingerprintsBatch(videoId, batchIndex++, currentBatch);
                  }
                  workerPool.terminate();
-                 resolve({ totalFrames: framesProcessed, batches: batchIndex });
+                 resolve({ totalFrames: framesProcessed, batches: batchIndex, jobId: '' });
               }
             }).catch(e => {
               console.error("Worker error", e);
@@ -253,7 +247,7 @@ export async function processVideoFile(
             : 0;
           console.log(`[DEBUG] Updated file reading offset to seek result offset: ${offset}`);
           isExtractionStarted = true;
-          chunkSize = 1024 * 1024 * 5; // switch to large chunks for fast processing
+          chunkSize = 1024 * 1024 * 5;
           resolveDecoderConfigured();
           if (resumeReading) {
             console.log("[DEBUG] Resuming file reading after decoder configuration.");
@@ -283,7 +277,6 @@ export async function processVideoFile(
       isProcessingSamples = true;
       
       while (pendingSamples.length > 0) {
-        // Backpressure on decoder
         if (decoder.decodeQueueSize > maxInflight || workerPool.inflightBitmaps > maxInflight) {
           await delay(10);
           continue;
@@ -330,7 +323,6 @@ export async function processVideoFile(
         return;
       }
 
-      // If onReady was triggered but extraction hasn't started yet, we pause reading
       if (trackInfo && !isExtractionStarted) {
         console.log("[DEBUG] Pausing file reading until extraction starts...");
         resumeReading = () => readNextChunk();
@@ -361,9 +353,8 @@ export async function processVideoOnServer(
   file: File,
   videoId: string,
   onProgress: (framesProcessed: number, totalFrames: number, inflight: number) => void
-): Promise<{ totalFrames: number, batches: number }> {
-  // 1. Upload video file to server in chunks
-  const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+): Promise<{ totalFrames: number, batches: number, jobId: string }> {
+  const CHUNK_SIZE = 5 * 1024 * 1024;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const uploadId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
   let jobId = '';
@@ -394,7 +385,7 @@ export async function processVideoOnServer(
   }
   console.log(`[Server Process] File uploaded, Job ID: ${jobId}`);
 
-  // 2. Poll status endpoint
+  // Poll status endpoint
   let done = false;
   let totalFrames = 0;
   let processedFrames = 0;
@@ -419,16 +410,15 @@ export async function processVideoOnServer(
     }
   }
 
-  // 3. Fetch processed results
+  // Fetch processed results and store in IndexedDB (for browser-mode compatibility)
   const resultRes = await fetch(`/api/result/${jobId}`);
   if (!resultRes.ok) {
     throw new Error(`Failed to fetch job results for ${jobId}`);
   }
 
   const fingerprints: FrameFingerprint[] = await resultRes.json();
-  console.log(`[Server Process] Fetched ${fingerprints.length} fingerprints.`);
+  console.log(`[Server Process] Fetched ${fingerprints.length} fingerprints for job ${jobId}.`);
 
-  // 4. Batch and save to IndexedDB to preserve downstream app logic
   const batchSize = 300;
   let batchIndex = 0;
   for (let i = 0; i < fingerprints.length; i += batchSize) {
@@ -436,6 +426,5 @@ export async function processVideoOnServer(
     await saveFingerprintsBatch(videoId, batchIndex++, chunk);
   }
 
-  return { totalFrames: fingerprints.length, batches: batchIndex };
+  return { totalFrames: fingerprints.length, batches: batchIndex, jobId };
 }
-

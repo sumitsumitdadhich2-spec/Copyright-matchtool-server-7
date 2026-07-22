@@ -1,7 +1,18 @@
+export interface FrameSignature {
+  /** Flat array: 4x4 grid of cells, each cell has avg R, G, B = 48 values total (0-255) */
+  colorGrid: number[];
+  /** 4x4 = 16 values, fraction of pixels per cell matching skin-tone heuristic (0-1) */
+  skinScoreGrid: number[];
+  /** 4x4 = 16 values, mean-absolute-deviation of grayscale per cell (texture measure, 0-255) */
+  detailGrid: number[];
+}
+
 export interface FrameFingerprint {
   frameIndex: number;
   timestamp: number;
   variants: Record<string, { hash: string }>;
+  /** Optional: computed from the 'full' variant 16x16 image for weighted similarity */
+  signature?: FrameSignature;
 }
 
 export interface CropRect {
@@ -20,13 +31,13 @@ export function getCropRects(width: number, height: number): CropRect[] {
   
   // 2. 9:16 variants (5 crops)
   let cropWidth = Math.round(height * (9 / 16));
-  if (cropWidth % 2 !== 0) cropWidth--; // Ensure even crop width
+  if (cropWidth % 2 !== 0) cropWidth--;
   
   if (cropWidth <= width) {
     const step = (width - cropWidth) / 4;
     for (let i = 0; i < 5; i++) {
       let sx = Math.round(i * step);
-      if (sx % 2 !== 0) sx--; // Ensure even step offset
+      if (sx % 2 !== 0) sx--;
       rects.push({
         name: `crop_9_16_${i}`,
         sx,
@@ -36,7 +47,6 @@ export function getCropRects(width: number, height: number): CropRect[] {
       });
     }
   } else {
-    // Fallback if width is already less than cropWidth
     for (let i = 0; i < 5; i++) {
       rects.push({
         name: `crop_9_16_${i}`,
@@ -55,47 +65,21 @@ export function getCropRects(width: number, height: number): CropRect[] {
     if (sw % 2 !== 0) sw--;
     if (sh % 2 !== 0) sh--;
     
-    // Center-weighted vertical offset
     let sy = Math.min(height - sh, Math.max(0, Math.round((height - sh) / 2)));
     if (sy % 2 !== 0) sy--;
     
-    // Center position
     let sxCenter = Math.min(width - sw, Math.max(0, Math.round((width - sw) / 2)));
     if (sxCenter % 2 !== 0) sxCenter--;
     
-    rects.push({
-      name: `${namePrefix}_center`,
-      sx: sxCenter,
-      sy,
-      sw,
-      sh
-    });
+    rects.push({ name: `${namePrefix}_center`, sx: sxCenter, sy, sw, sh });
+    rects.push({ name: `${namePrefix}_left`, sx: 0, sy, sw, sh });
     
-    // Left position
-    rects.push({
-      name: `${namePrefix}_left`,
-      sx: 0,
-      sy,
-      sw,
-      sh
-    });
-    
-    // Right position
     let sxRight = Math.min(width - sw, Math.max(0, width - sw));
     if (sxRight % 2 !== 0) sxRight--;
-    rects.push({
-      name: `${namePrefix}_right`,
-      sx: sxRight,
-      sy,
-      sw,
-      sh
-    });
+    rects.push({ name: `${namePrefix}_right`, sx: sxRight, sy, sw, sh });
   };
 
-  // 1.25x zoom (Center, Left, Right)
   addZoomCrops(1.25, 'zoom_1_25');
-
-  // 1.5x zoom (Center, Left, Right)
   addZoomCrops(1.5, 'zoom_1_5');
 
   // 2.0x zoom (Center only)
@@ -110,13 +94,7 @@ export function getCropRects(width: number, height: number): CropRect[] {
   let sy2 = Math.min(height - sh2, Math.max(0, Math.round((height - sh2) / 2)));
   if (sy2 % 2 !== 0) sy2--;
   
-  rects.push({
-    name: 'zoom_2_0_center',
-    sx: sx2,
-    sy: sy2,
-    sw: sw2,
-    sh: sh2
-  });
+  rects.push({ name: 'zoom_2_0_center', sx: sx2, sy: sy2, sw: sw2, sh: sh2 });
   
   return rects;
 }
@@ -127,7 +105,6 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
   let hasSubtitles = false;
   let subtitlePixelCount = 0;
   
-  // Subtitles are generally in the bottom 25% of the frame
   const startY = Math.floor(height * 0.75);
   
   for (let y = startY; y < height; y++) {
@@ -135,11 +112,7 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
       const idx = (y * width + x) * 4;
       const r = data[idx];
       const g = data[idx + 1];
-      const b = data[idx + 2];
       
-      // White and Yellow subtitle detection
-      // Yellow: High R & G, lower B
-      // White: High R & G & B
       if (r > 180 && g > 180) {
         mask[y * width + x] = 1;
         hasSubtitles = true;
@@ -157,7 +130,6 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
     return false;
   }
   
-  // Dilation (radius 2)
   const dilated = new Uint8Array(width * height);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -175,7 +147,6 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
     }
   }
   
-  // Vertical Inpainting: replace with nearest non-dilated pixel above
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       if (dilated[y * width + x] === 1) {
@@ -202,7 +173,69 @@ export function processSubtitles(imageData: ImageData, forceFullPass: boolean): 
   return true;
 }
 
-export function computeHashAndFeatures(imageData: ImageData): { hash: string } {
+/**
+ * Compute a 4×4 spatial signature from a 16×16 ImageData.
+ * Each cell covers 4×4 pixels, giving:
+ *   colorGrid:     16 cells × 3 (avg R,G,B) = 48 values  [0-255]
+ *   skinScoreGrid: 16 cells × 1 (skin fraction)            [0-1]
+ *   detailGrid:    16 cells × 1 (MAD of gray, texture)    [0-255]
+ */
+export function computeSignature(imageData: ImageData): FrameSignature {
+  const { width, height, data } = imageData;
+  const cellW = Math.max(1, Math.floor(width / 4));
+  const cellH = Math.max(1, Math.floor(height / 4));
+
+  const colorGrid: number[] = [];
+  const skinScoreGrid: number[] = [];
+  const detailGrid: number[] = [];
+
+  for (let row = 0; row < 4; row++) {
+    for (let col = 0; col < 4; col++) {
+      const startY = row * cellH;
+      const startX = col * cellW;
+      const endY = Math.min(startY + cellH, height);
+      const endX = Math.min(startX + cellW, width);
+
+      let sumR = 0, sumG = 0, sumB = 0;
+      let skinCount = 0;
+      const grays: number[] = [];
+
+      for (let y = startY; y < endY; y++) {
+        for (let x = startX; x < endX; x++) {
+          const idx = (y * width + x) * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+
+          sumR += r; sumG += g; sumB += b;
+
+          // Simple skin-tone heuristic (works on both light and medium skin)
+          if (r > 80 && g > 40 && b > 20 && r > g && r > b && (r - b) > 20) {
+            skinCount++;
+          }
+
+          grays.push(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+      }
+
+      const n = grays.length || 1;
+      colorGrid.push(sumR / n, sumG / n, sumB / n);
+      skinScoreGrid.push(skinCount / n);
+
+      // Mean-absolute-deviation as texture measure
+      const meanGray = grays.reduce((a, v) => a + v, 0) / n;
+      const mad = grays.reduce((a, v) => a + Math.abs(v - meanGray), 0) / n;
+      detailGrid.push(mad);
+    }
+  }
+
+  return { colorGrid, skinScoreGrid, detailGrid };
+}
+
+export function computeHashAndFeatures(
+  imageData: ImageData,
+  includeSignature = false
+): { hash: string; signature?: FrameSignature } {
   const { width, height, data } = imageData;
   let totalGray = 0;
   const grays = new Float32Array(width * height);
@@ -213,7 +246,6 @@ export function computeHashAndFeatures(imageData: ImageData): { hash: string } {
     const g = data[idx + 1];
     const b = data[idx + 2];
     
-    // Grayscale conversion
     const gray = 0.299 * r + 0.587 * g + 0.114 * b;
     grays[i] = gray;
     totalGray += gray;
@@ -221,7 +253,6 @@ export function computeHashAndFeatures(imageData: ImageData): { hash: string } {
   
   const avgGray = totalGray / (width * height);
   
-  // Calculate variance to detect low-entropy/flat/uniform solid-color frames
   let sumSqDiff = 0;
   for (let i = 0; i < width * height; i++) {
     const diff = grays[i] - avgGray;
@@ -231,10 +262,8 @@ export function computeHashAndFeatures(imageData: ImageData): { hash: string } {
   
   let hash = '';
   if (variance < 1.0) {
-    // Completely uniform or low-entropy frame - return deterministic flat hash
     hash = '0'.repeat(width * height);
   } else {
-    // Apply a 3-pass 3x3 box blur to filter out sub-pixel high-frequency rendering and scaling noise
     let currentGrays = grays;
     for (let pass = 0; pass < 3; pass++) {
       const smoothedGrays = new Float32Array(width * height);
@@ -262,8 +291,9 @@ export function computeHashAndFeatures(imageData: ImageData): { hash: string } {
       hash += currentGrays[i] >= avgGray ? '1' : '0';
     }
   }
-  
-  return { hash };
+
+  const signature = includeSignature ? computeSignature(imageData) : undefined;
+  return { hash, signature };
 }
 
 export function computeFingerprint(
@@ -276,7 +306,6 @@ export function computeFingerprint(
   const rects = getCropRects(width, height);
   const variants: Record<string, { hash: string }> = {};
   
-  // Downscale full frame to a standard intermediate size (e.g., standard height 120)
   const H_down = 120;
   const W_down = Math.round(width * (H_down / height));
   
@@ -292,7 +321,6 @@ export function computeFingerprint(
   
   const imgData = fullDownCtx.getImageData(0, 0, W_down, H_down);
   const changed = processSubtitles(imgData, false);
-  console.log(`[FINGERPRINT_WORKER] width=${width} height=${height} W_down=${W_down} H_down=${H_down} changed=${changed}`);
   if (changed) {
     fullDownCtx.putImageData(imgData, 0, 0);
   }
@@ -305,6 +333,8 @@ export function computeFingerprint(
   
   const scaleX = W_down / width;
   const scaleY = H_down / height;
+
+  let fullVariantSignature: FrameSignature | undefined;
   
   for (const rect of rects) {
     finalCtx.fillStyle = '#000000';
@@ -320,13 +350,19 @@ export function computeFingerprint(
     }
     
     const finalImgData = finalCtx.getImageData(0, 0, 16, 16);
-    const features = computeHashAndFeatures(finalImgData);
-    variants[rect.name] = features;
+    // Only compute signature for the 'full' variant
+    const isFullVariant = rect.name === 'full';
+    const features = computeHashAndFeatures(finalImgData, isFullVariant);
+    variants[rect.name] = { hash: features.hash };
+    if (isFullVariant && features.signature) {
+      fullVariantSignature = features.signature;
+    }
   }
   
   return {
     frameIndex,
     timestamp,
-    variants
+    variants,
+    signature: fullVariantSignature
   };
 }

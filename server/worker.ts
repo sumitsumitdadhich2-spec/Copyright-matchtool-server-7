@@ -1,6 +1,6 @@
 import { parentPort } from 'worker_threads';
 import { createCanvas } from 'canvas';
-import { getCropRects, processSubtitles, computeHashAndFeatures } from '../src/shared/fingerprint';
+import { getCropRects, processSubtitles, computeHashAndFeatures, computeSignature, FrameSignature } from '../src/shared/fingerprint';
 
 parentPort?.on('message', async (message) => {
   const { id, frameBuffer, width, height } = message;
@@ -13,9 +13,9 @@ parentPort?.on('message', async (message) => {
     ctx.putImageData(imgData, 0, 0);
     
     const rects = getCropRects(width, height);
-    const variants: Record<string, any> = {};
+    const variants: Record<string, { hash: string }> = {};
     
-    // Downscale full frame to a standard intermediate size (e.g., standard height 120)
+    // Downscale full frame to a standard intermediate size
     const H_down = 120;
     const W_down = Math.round(width * (H_down / height));
     
@@ -43,6 +43,8 @@ parentPort?.on('message', async (message) => {
     
     const scaleX = W_down / width;
     const scaleY = H_down / height;
+
+    let signature: FrameSignature | undefined;
     
     for (const rect of rects) {
       finalCtx.fillStyle = '#000000';
@@ -57,12 +59,17 @@ parentPort?.on('message', async (message) => {
         finalCtx.drawImage(fullDownCanvas, sx, sy, sw, sh, 0, 0, 16, 16);
       }
       const finalImgData = finalCtx.getImageData(0, 0, 16, 16);
-      
-      const features = computeHashAndFeatures(finalImgData as any);
-      variants[rect.name] = features;
+
+      // Compute signature only for the 'full' variant (one per frame)
+      const isFullVariant = rect.name === 'full';
+      const features = computeHashAndFeatures(finalImgData as any, isFullVariant);
+      variants[rect.name] = { hash: features.hash };
+      if (isFullVariant && features.signature) {
+        signature = features.signature;
+      }
     }
     
-    parentPort?.postMessage({ id, result: variants });
+    parentPort?.postMessage({ id, result: { variants, signature } });
   } catch (error: any) {
     parentPort?.postMessage({ id, error: error.message || String(error) });
   }

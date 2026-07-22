@@ -3,13 +3,13 @@ import { Worker } from 'worker_threads';
 import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { FrameSignature } from '../src/shared/fingerprint';
 
 const getDirname = () => {
   if (typeof __dirname !== 'undefined') {
     return __dirname;
   }
   try {
-    // In dev / tsx mode (ESM), import.meta.url is available
     const metaUrl = typeof import.meta !== 'undefined' && import.meta.url ? import.meta.url : '';
     if (metaUrl) {
       return path.dirname(fileURLToPath(metaUrl));
@@ -27,7 +27,8 @@ export const NUM_WORKERS = Math.max(1, Math.min(os.cpus().length, 128));
 export interface FingerprintResult {
   frameIndex: number;
   timestamp: number;
-  variants: any;
+  variants: Record<string, { hash: string }>;
+  signature?: FrameSignature;
 }
 
 export function extractFingerprints(
@@ -41,12 +42,12 @@ export function extractFingerprints(
     let taskIdCounter = 0;
     let decoded = 0;
     let processed = 0;
-    const fingerprints = new Map<number, any>();
+    // Each entry: { variants, signature? }
+    const fingerprints = new Map<number, { variants: any; signature?: FrameSignature }>();
     const taskQueue: { id: number; frameBuffer: Buffer; width: number; height: number; frameIndex: number }[] = [];
     let ffmpegProcess: any = null;
     let isFinished = false;
 
-    // Helper to cleanup all workers
     const cleanupWorkers = () => {
       for (const w of workers) {
         w.terminate().catch(() => {});
@@ -70,7 +71,6 @@ export function extractFingerprints(
     }
 
     try {
-      // Spawn worker threads relative to this module directory
       const isProd = process.env.NODE_ENV === 'production';
       const workerPath = isProd 
         ? path.join(currentDirname, 'worker.cjs')
@@ -102,13 +102,9 @@ export function extractFingerprints(
         worker.on('error', (err) => {
           console.error(`Worker error:`, err);
           const index = workers.indexOf(worker);
-          if (index !== -1) {
-            workers.splice(index, 1);
-          }
+          if (index !== -1) workers.splice(index, 1);
           const idleIndex = idleWorkers.indexOf(worker);
-          if (idleIndex !== -1) {
-            idleWorkers.splice(idleIndex, 1);
-          }
+          if (idleIndex !== -1) idleWorkers.splice(idleIndex, 1);
           assignTasks();
         });
 
@@ -136,7 +132,6 @@ export function extractFingerprints(
 
       console.log(`Pipeline starting for ${videoPath} (${width}x${height})`);
 
-      // Spawn ffmpeg with rawvideo RGBA output
       ffmpegProcess = spawn('ffmpeg', [
         '-i', videoPath,
         '-f', 'rawvideo',
@@ -159,15 +154,14 @@ export function extractFingerprints(
           const id = ++taskIdCounter;
           const currentFrame = decoded;
 
-          const p = new Promise<any>((res, rej) => {
+          const p = new Promise<{ variants: any; signature?: FrameSignature }>((res, rej) => {
             activeTasks.set(id, { resolve: res, reject: rej });
           });
 
-          p.then((variants) => {
-            fingerprints.set(currentFrame, variants);
+          p.then((result) => {
+            fingerprints.set(currentFrame, result);
           }).catch((err) => {
             console.error(`Error processing frame ${currentFrame}:`, err);
-            // Even if processing fails, mark as processed to prevent stalling the pipeline
             processed++;
             if (onProgress) {
               onProgress(decoded, processed);
@@ -190,8 +184,8 @@ export function extractFingerprints(
         }
       });
 
-      ffmpegProcess.stderr.on('data', (data: Buffer) => {
-        // Suppress stderr logs or route to debug if needed
+      ffmpegProcess.stderr.on('data', (_data: Buffer) => {
+        // suppress ffmpeg stderr
       });
 
       ffmpegProcess.on('error', (err: any) => {
@@ -200,7 +194,7 @@ export function extractFingerprints(
         reject(err);
       });
 
-      ffmpegProcess.on('close', (code: any) => {
+      ffmpegProcess.on('close', (_code: any) => {
         const checkInterval = setInterval(() => {
           if (processed >= decoded) {
             clearInterval(checkInterval);
@@ -210,11 +204,13 @@ export function extractFingerprints(
 
               const sortedFp: FingerprintResult[] = [];
               for (let i = 1; i <= decoded; i++) {
-                if (fingerprints.has(i)) {
+                const fp = fingerprints.get(i);
+                if (fp) {
                   sortedFp.push({
                     frameIndex: i,
                     timestamp: (i - 1) / 25,
-                    variants: fingerprints.get(i)
+                    variants: fp.variants,
+                    signature: fp.signature
                   });
                 }
               }
