@@ -16,8 +16,8 @@ RUN npm ci --ignore-scripts || npm install --ignore-scripts
 # Copy the rest of the application
 COPY . .
 
-# Install server-specific dependencies (e.g., canvas, fluent-ffmpeg) and rebuild canvas at root
-RUN cd server && npm install && cd .. && npm rebuild canvas
+# Rebuild native modules (canvas) now that native libs are present
+RUN npm rebuild canvas
 
 # Build the frontend and backend (Vite + esbuild)
 RUN npm run build
