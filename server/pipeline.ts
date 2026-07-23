@@ -78,7 +78,7 @@ export function extractFingerprints(
       
       for (let i = 0; i < NUM_WORKERS; i++) {
         const worker = new Worker(workerPath, isProd ? {} : {
-          execArgv: ['--import', 'tsx']
+          execArgv: ['-r', 'tsx/cjs']
         });
         
         worker.on('message', (msg) => {

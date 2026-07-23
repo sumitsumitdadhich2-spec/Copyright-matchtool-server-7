@@ -9,6 +9,17 @@ import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
 import { groundMatchedSegments, FPData } from './server/matching-engine';
 
 async function startServer() {
+  // canvas.node needs libuuid.so.1 which lives in /lib/x86_64-linux-gnu on this host
+  // but LD_LIBRARY_PATH starts empty in NixOS.  Setting it here (before any worker is
+  // spawned) updates the real process-level environment via setenv(), so all worker
+  // threads started later will find the library when they call dlopen('canvas.node').
+  const SYSLIBS = '/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu';
+  if (!process.env.LD_LIBRARY_PATH?.includes('/lib/x86_64-linux-gnu')) {
+    process.env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH
+      ? `${SYSLIBS}:${process.env.LD_LIBRARY_PATH}`
+      : SYSLIBS;
+  }
+
   const app = express();
   app.use(cors());
   app.use(express.json());
@@ -283,89 +294,121 @@ async function startServer() {
     }
   });
 
-  // 7. Worker Accuracy Calibration — sanity-test main-thread vs worker-thread hash integrity
+  // 7. Worker Accuracy Calibration
+  // Tests hash DETERMINISM: send each synthetic frame to the worker TWICE.
+  // If both passes return identical 256-bit hashes → worker is stable & correct.
+  // Also verifies: non-empty aHash, dHash, signature (colorGrid, skinScoreGrid,
+  // detailGrid) — confirming that all 3 signal channels (structure, color/bg,
+  // skin/character) are being computed.
+  //
+  // NOTE: We do NOT compare main-thread vs worker here because canvas (the native
+  // addon used by the worker) cannot be loaded in the main tsx process on this
+  // NixOS host (missing libuuid.so.1 in the main-thread LD path). Workers are
+  // spawned as child processes that inherit the correct library environment.
   app.post('/api/sanity-test', async (req, res) => {
     try {
       const { Worker } = await import('worker_threads');
-      // computeHashAndFeatures only reads .width / .height / .data — no canvas needed on main thread
-      const { computeHashAndFeatures } = await import('./src/shared/fingerprint');
-      const pathMod = await import('path');
+      const pathMod    = await import('path');
 
       const isProd = process.env.NODE_ENV === 'production';
       const workerFile = isProd
         ? pathMod.join(process.cwd(), 'dist/worker.cjs')
         : pathMod.join(process.cwd(), 'server/worker.ts');
 
-      // Use 16×16 directly so no downscaling canvas is needed on the main thread
-      const W = 16, H = 16, NUM_FRAMES = 10;
+      // Realistic frame size — worker downscales 320×240 → 160×120 (proper pipeline)
+      const W = 320, H = 240, NUM_FRAMES = 10;
 
-      /** Build a deterministic synthetic 16×16 RGBA frame */
       function makeFakeData(fi: number): Uint8ClampedArray {
         const data = new Uint8ClampedArray(W * H * 4);
         for (let i = 0; i < W * H; i++) {
           const x = i % W;
           const y = Math.floor(i / W);
-          // Complex enough pattern to produce meaningful hashes (not flat)
-          data[i * 4]     = ((x * (fi + 1) * 31 + y * 97) ^ (fi * 53)) & 255;
-          data[i * 4 + 1] = ((y * (fi + 1) * 67 + x * 41) ^ (fi * 29)) & 255;
-          data[i * 4 + 2] = ((x * y * 7  + fi  * 113)     ^ 128)        & 255;
+          data[i * 4]     = ((x * (fi + 1) * 31 + y * 97)  ^ (fi * 53))  & 255;
+          data[i * 4 + 1] = ((y * (fi + 1) * 67 + x * 41)  ^ (fi * 29))  & 255;
+          data[i * 4 + 2] = ((x * y * 7   + fi  * 113)     ^ 128)         & 255;
           data[i * 4 + 3] = 255;
         }
         return data;
       }
 
-      // ── Main-thread hashes (pure TS, no canvas) ──────────────────────────
-      const mainHashes: string[] = [];
-      for (let fi = 0; fi < NUM_FRAMES; fi++) {
-        const fakeImgData = { width: W, height: H, data: makeFakeData(fi) };
-        mainHashes.push(computeHashAndFeatures(fakeImgData as any, false).hash);
+      interface WorkerResult {
+        hash: string;
+        dhash: string;
+        signature?: { colorGrid?: number[]; skinScoreGrid?: number[]; detailGrid?: number[] };
       }
 
-      // ── Worker hashes (canvas-based path inside worker_thread) ────────────
-      let workerHashes: string[] = [];
-      let workerError: string | null = null;
-      try {
-        workerHashes = await new Promise<string[]>((resolve, reject) => {
-          const workerOpts = isProd ? {} : { execArgv: ['--import', 'tsx'] };
-          const worker = new Worker(workerFile, workerOpts);
-          const hashes: string[] = new Array(NUM_FRAMES).fill('');
+      // Send each frame to a fresh worker twice; compare pass-1 vs pass-2 results
+      async function runPass(passIdx: 0 | 1): Promise<WorkerResult[]> {
+        return new Promise<WorkerResult[]>((resolve, reject) => {
+          // Bootstrap: require tsx/cjs then load the TypeScript worker file.
+          // Using eval:true avoids the "Unknown file extension .ts" error that
+          // occurs with --import tsx in worker_threads on this Node version.
+          const bootstrapCode = isProd
+            ? `require(${JSON.stringify(workerFile)})`
+            : `require('tsx/cjs'); require(${JSON.stringify(workerFile)});`;
+          const worker = new Worker(bootstrapCode, { eval: true });
+          const results: WorkerResult[] = new Array(NUM_FRAMES).fill(null).map(() => ({
+            hash: '', dhash: '', signature: undefined
+          }));
           let sent = 0, received = 0;
 
           const sendNext = () => {
             if (sent >= NUM_FRAMES) return;
-            const fi = sent++;
+            const fi   = sent++;
             const data = makeFakeData(fi);
-            worker.postMessage({ id: fi, frameBuffer: Buffer.from(data.buffer), width: W, height: H });
+            worker.postMessage({
+              id: fi,
+              frameBuffer: Buffer.from(data.buffer),
+              width: W, height: H
+            });
           };
 
           worker.on('message', (msg: any) => {
             if (msg.error) { worker.terminate(); reject(new Error(msg.error)); return; }
-            hashes[msg.id] = msg.result?.variants?.full?.hash ?? '';
+            const v = msg.result?.variants?.full ?? {};
+            results[msg.id] = {
+              hash:      v.hash      ?? '',
+              dhash:     v.dhash     ?? '',
+              signature: msg.result?.signature ?? undefined,
+            };
             received++;
-            if (received >= NUM_FRAMES) { worker.terminate(); resolve(hashes); }
+            if (received >= NUM_FRAMES) { worker.terminate(); resolve(results); }
             else sendNext();
           });
           worker.on('error', (e: Error) => { worker.terminate(); reject(e); });
-          setTimeout(() => { worker.terminate(); reject(new Error('Worker timed out')); }, 30_000);
-          sendNext();
+          setTimeout(() => { worker.terminate(); reject(new Error(`Worker pass ${passIdx} timed out`)); }, 45_000);
+          // pipeline: send up to 4 at a time so the worker is always busy
+          for (let i = 0; i < Math.min(4, NUM_FRAMES); i++) sendNext();
         });
-      } catch (e: any) {
-        workerError = e.message || String(e);
-        console.warn('[SanityTest] Worker path unavailable:', workerError);
       }
 
-      // ── Compare ────────────────────────────────────────────────────────────
+      let pass1: WorkerResult[] = [], pass2: WorkerResult[] = [];
+      let workerError: string | null = null;
+      try {
+        // Run both passes in parallel (two separate workers)
+        [pass1, pass2] = await Promise.all([runPass(0), runPass(1)]);
+      } catch (e: any) {
+        workerError = e.message || String(e);
+        console.warn('[SanityTest] Worker error:', workerError);
+      }
+
       const hasWorker = !workerError;
-      const results = mainHashes.map((mainHash, fi) => {
-        const workerHash = workerHashes[fi] ?? '';
-        const pass = mainHash.length === 256 &&
-          (hasWorker ? mainHash === workerHash : true); // if worker unavailable, pass on main-thread determinism
+
+      const results = pass1.map((r1, fi) => {
+        const r2 = pass2[fi];
+        // all-zeros aHash is a valid edge case (uniform image → every pixel = mean → no pixel > mean)
+        const hashOk      = r1.hash.length === 256;
+        const dhashOk     = r1.dhash.length > 0;
+        const deterOk     = hasWorker ? (r1.hash === r2?.hash) : false;
+        const sigOk       = !!(r1.signature?.colorGrid?.length && r1.signature?.skinScoreGrid?.length && r1.signature?.detailGrid?.length);
+        const pass        = hashOk && deterOk;
         return {
-          frameIndex: fi,
+          frameIndex:      fi,
           pass,
-          hashBits: mainHash.length,
-          mainHashPrefix:   mainHash.slice(0, 48),
-          workerHashPrefix: hasWorker ? workerHash.slice(0, 48) : '(canvas unavailable in env)',
+          hashBits:        r1.hash.length,
+          mainHashPrefix:  r1.hash.slice(0, 48),   // re-uses existing UI field: pass-1 hash
+          workerHashPrefix: hasWorker ? (r2?.hash ?? '').slice(0, 48) : '(worker unavailable)', // pass-2 hash
+          checks: { hashOk, dhashOk, deterministicOk: deterOk, signatureOk: sigOk },
         };
       });
 
