@@ -507,22 +507,26 @@ function shortConsecutiveSim(sSet: PreSet, si: number): number {
  * Detect scene cuts in the short clip using three independent signals.
  * A frame is a cut if ANY signal exceeds its threshold:
  *
- *  Signal 1 — aHash consecutive similarity < aThreshold (38)
- *              aHash is brightness-distribution based; catches global lighting changes.
+ *  Signal 1 — aHash consecutive similarity < aThreshold (25)
+ *              aHash is brightness-distribution based; only catches very dramatic
+ *              global lighting changes (real hard cuts), not camera motion.
  *
- *  Signal 2 — dHash consecutive similarity < dThreshold (42)
- *              dHash is gradient/edge based; catches local pattern changes even when
- *              global brightness is similar (e.g. beach scenes switching composition).
+ *  Signal 2 — dHash consecutive similarity < dThreshold (28)
+ *              dHash is gradient/edge based; only catches very dramatic edge pattern
+ *              changes, not pans/zooms within the same scene.
  *
- *  Signal 3 — Temporal color-grid magnitude > colorMagThreshold (28)
- *              L2 norm of frame-to-frame color grid delta; catches hue/saturation shifts
- *              that aHash & dHash might miss.
+ *  Signal 3 — Temporal color-grid magnitude > colorMagThreshold (100)
+ *              L2 norm of frame-to-frame color grid delta (colorGrid is 0-255 per
+ *              channel, 48 values).  A real hard cut between visually distinct scenes
+ *              produces tMag >> 100.  Camera motion within a scene produces tMag < 50.
+ *              Old value (28) ≈ 4 per cell change = 1.6 % of full range — far too
+ *              sensitive; triggered on any pan/zoom and caused 49 false cuts.
  */
 function detectSceneCuts(
   sSet: PreSet,
-  aThreshold       = 38,
-  dThreshold       = 42,
-  colorMagThreshold = 28
+  aThreshold       = 25,
+  dThreshold       = 28,
+  colorMagThreshold = 100
 ): Uint8Array {
   const isCut = new Uint8Array(sSet.fps.length);
 
@@ -763,6 +767,78 @@ function acceptSegment(
 }
 
 // ---------------------------------------------------------------------------
+// Post-process: merge temporally adjacent segments that belong to the same run
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge consecutive segments where:
+ *  - The gap in the short clip is small (< SHORT_GAP_MAX seconds)
+ *  - The movie timeline is progressing forward and proportionally
+ *
+ * This repairs over-segmentation caused by false scene cuts: two segments
+ * that should be one continuous match get re-joined here.
+ *
+ * Example: seg A ends at clip 9.76s/movie 15.44s, seg B starts at clip
+ * 9.80s/movie 14.04s.  Short gap = 0.04 s (1 frame).  Movie gap = -1.4 s
+ * (backward — likely a false cut inside a static/slow scene).  These should
+ * NOT be merged (movie goes backward too far).
+ *
+ * Example: seg A ends clip 1.33s/movie 2.83s, seg B starts clip 1.38s/movie
+ * 3.42s.  Short gap = 0.05 s, movie gap = 0.59 s.  Merge → single segment.
+ */
+function mergeAdjacentSegments(segs: MatchedSegment[]): MatchedSegment[] {
+  if (segs.length <= 1) return segs;
+
+  // Work in short-clip time order
+  const sorted = [...segs].sort((a, b) => a.shortStart - b.shortStart);
+
+  // Max allowed gap (seconds) in the short clip between two segments to merge
+  const SHORT_GAP_MAX = 0.52; // ~13 frames @ 25 fps
+
+  const result: MatchedSegment[] = [];
+  let cur = sorted[0];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const nxt = sorted[i];
+
+    const shortGap = nxt.shortStart - cur.shortEnd;   // gap in clip  (s)
+    const movieGap = nxt.movieStart - cur.movieEnd;   // gap in movie (s)
+
+    // Allow merge when:
+    //  1. Short gap is small (same scene, brief false-cut boundary)
+    //  2. Movie time is moving forward (or very slightly backward — 1 frame jitter)
+    //  3. Movie gap is proportional to short gap (same speed ratio, ±4 s tolerance)
+    const mergeable =
+      shortGap >= -0.04 &&
+      shortGap <= SHORT_GAP_MAX &&
+      movieGap >= -0.08 &&                             // not jumping backward in movie
+      movieGap <= shortGap * 5 + 2.5;                 // movie gap roughly proportional
+
+    if (mergeable) {
+      const totalFrames = cur.frameCount + nxt.frameCount;
+      cur = {
+        ...cur,
+        shortEnd:   nxt.shortEnd,
+        movieEnd:   nxt.movieEnd,
+        frameCount: totalFrames,
+        confidence: (cur.confidence * cur.frameCount + nxt.confidence * nxt.frameCount) / totalFrames,
+        isApproximate: cur.isApproximate || nxt.isApproximate,
+        gapCount:   cur.gapCount + nxt.gapCount + Math.round(shortGap * 25),
+        matchSequence:  [...cur.matchSequence, ...nxt.matchSequence],
+        bestFrameDetail: (cur.bestFrameDetail && nxt.bestFrameDetail)
+          ? (cur.confidence >= nxt.confidence ? cur.bestFrameDetail : nxt.bestFrameDetail)
+          : (cur.bestFrameDetail ?? nxt.bestFrameDetail),
+      };
+    } else {
+      result.push(cur);
+      cur = nxt;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Main engine — v5 scene-chunk-first
 // ---------------------------------------------------------------------------
 
@@ -919,8 +995,14 @@ export async function groundMatchedSegments(
   }
 
   // ------------------------------------------------------------------
-  // Pass 3: forced best-match — every unmatched chunk MUST produce a segment
+  // Pass 3: forced best-match — only for chunks large enough to be real scenes
   // ------------------------------------------------------------------
+  // Small chunks (< MIN_FORCED_FRAMES) are almost always caused by false scene
+  // cuts (e.g. a single-frame brightness spike, motion blur, etc.).  Forcing a
+  // segment for them produces spurious 1–4 frame segments with random movie
+  // times.  Skip them; they'll become tiny "unmatched" ranges (< 0.2 s) which
+  // are invisible to the user.
+  const MIN_FORCED_FRAMES = 6;
   let pass3Count = 0;
 
   for (const chunk of chunks) {
@@ -929,6 +1011,11 @@ export async function groundMatchedSegments(
       if (!usedShort[si]) remaining.push(si);
     }
     if (remaining.length === 0) continue;
+
+    if (remaining.length < MIN_FORCED_FRAMES) {
+      console.log(`[Matcher] Pass 3 (skip): chunk [${chunk.start}–${chunk.end}], only ${remaining.length} frame(s) — too small to force-match.`);
+      continue;
+    }
 
     console.log(`[Matcher] Pass 3 (forced): chunk [${chunk.start}–${chunk.end}], ${remaining.length} unmatched frame(s)…`);
 
@@ -978,13 +1065,22 @@ export async function groundMatchedSegments(
   }
 
   // ------------------------------------------------------------------
+  // Merge adjacent segments that belong to the same continuous run.
+  // This repairs over-segmentation from false scene cuts: two segments
+  // that should be one get re-joined if their short-clip gap is small
+  // and the movie timeline progresses forward proportionally.
+  // ------------------------------------------------------------------
+  const preDedup = mergeAdjacentSegments(segments);
+  console.log(`[Matcher] After merge: ${preDedup.length} segment(s) (was ${segments.length}).`);
+
+  // ------------------------------------------------------------------
   // Deduplication — keep highest-confidence segment when short-clip
   // ranges overlap by more than 0.15 s
   // ------------------------------------------------------------------
-  segments.sort((a, b) => b.confidence - a.confidence);
+  preDedup.sort((a, b) => b.confidence - a.confidence);
 
   const final: MatchedSegment[] = [];
-  for (const seg of segments) {
+  for (const seg of preDedup) {
     const overlaps = final.some(kept => {
       const oStart = Math.max(kept.shortStart, seg.shortStart);
       const oEnd   = Math.min(kept.shortEnd,   seg.shortEnd);
