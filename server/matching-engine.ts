@@ -666,6 +666,51 @@ function walkOneDir(
 }
 
 // ---------------------------------------------------------------------------
+// Gap interpolation — bridge 1-2 skipped short frames within a sequence
+// ---------------------------------------------------------------------------
+
+/**
+ * When the directional walk encounters 1–2 consecutive short frames that
+ * fall below the similarity threshold (motion blur, compression artifact,
+ * on-screen text, brief brightness spike) it skips them and keeps going.
+ * Those skipped frames leave a gap in the sequence (si jumps by 2 or 3).
+ *
+ * This pass fills those gaps with linearly-interpolated movie indices and
+ * the averaged confidence of their immediate neighbours — implementing the
+ * "interpolate / bridge 1-2 dropped frames" behaviour described in the
+ * reference algorithm:
+ *
+ *   "Agar pichla frame match hai aur agla frame match hai, toh algorithm
+ *    ko us 1 frame ke error ko ignore karke block ko continue rakhna
+ *    chahiye."
+ *
+ * The interpolated frames are flagged via their sim value being the
+ * average of neighbours — they do not inflate the real confidence score.
+ */
+function fillSequenceGaps(seq: RawSeq[], maxFillGap = 2): RawSeq[] {
+  if (seq.length < 2) return seq;
+  const out: RawSeq[] = [seq[0]];
+  for (let i = 1; i < seq.length; i++) {
+    const prev = seq[i - 1];
+    const curr = seq[i];
+    const siGap = curr.si - prev.si; // how many short-clip frames were skipped
+    if (siGap > 1 && siGap <= maxFillGap + 1) {
+      // Fill each skipped frame with a linearly interpolated movie position
+      for (let g = 1; g < siGap; g++) {
+        const t = g / siGap;
+        out.push({
+          si:  prev.si + g,
+          mi:  Math.round(prev.mi + t * (curr.mi - prev.mi)),
+          sim: (prev.sim + curr.sim) / 2, // average of neighbours
+        });
+      }
+    }
+    out.push(curr);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Build one segment bidirectionally from a seed, bounded to [siMin, siMax]
 // ---------------------------------------------------------------------------
 
@@ -685,7 +730,9 @@ function buildSegment(
   const forwardSeq  = walkOneDir(sSet, mSet, seedSi, seedMi, usedShort,  1, isCut, frameDrift, siMin, siMax);
 
   backwardSeq.reverse();
-  return [...backwardSeq, { si: seedSi, mi: seedMi, sim: seedSim }, ...forwardSeq];
+  const raw = [...backwardSeq, { si: seedSi, mi: seedMi, sim: seedSim }, ...forwardSeq];
+  // Bridge 1-2 frame gaps: fills skipped frames (motion blur / compression artifact)
+  return fillSequenceGaps(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +816,63 @@ function acceptSegment(
 // ---------------------------------------------------------------------------
 // Post-process: merge temporally adjacent segments that belong to the same run
 // ---------------------------------------------------------------------------
+
+/**
+ * Context-aware validation of low-confidence segments.
+ *
+ * Segments accepted only at Pass-2 threshold (40–82 %) are kept only when
+ * at least one high-confidence neighbour confirms the movie timeline is
+ * progressing forward consistently.  This matches the reference algorithm:
+ *
+ *   "pichle scenes match hone ki wajah se isko validate kar diya gaya"
+ *   (Segment 9, 10 frames / 89 % — accepted because prior segments formed
+ *   a solid timeline.)
+ *
+ * Segments that fail this check are dropped; their clip frames become
+ * unmatchedRanges (altered / third-party content detection).
+ */
+function contextValidateSegments(segs: MatchedSegment[]): MatchedSegment[] {
+  if (segs.length <= 1) return segs;
+
+  const MIN_NEIGHBOUR_CONF = 85; // neighbour must be at least this confident
+  const MAX_MOVIE_JUMP     = 10; // movie time jump > this (s) is suspicious
+
+  const out: MatchedSegment[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+
+    // High-confidence or long segments are always kept
+    if (!seg.isApproximate || seg.confidence >= 80 || seg.frameCount >= 20) {
+      out.push(seg); continue;
+    }
+
+    // Low-confidence short segment — validate against neighbours
+    const prev = out.length > 0 ? out[out.length - 1] : null;
+    const next = i < segs.length - 1 ? segs[i + 1] : null;
+
+    const prevGood = prev !== null
+      && prev.confidence >= MIN_NEIGHBOUR_CONF
+      && seg.movieStart  >= prev.movieEnd - 1.0
+      && (seg.movieStart - prev.movieEnd) <= MAX_MOVIE_JUMP;
+
+    const nextGood = next !== null
+      && next.confidence >= MIN_NEIGHBOUR_CONF
+      && next.movieStart >= seg.movieEnd - 1.0
+      && (next.movieStart - seg.movieEnd) <= MAX_MOVIE_JUMP;
+
+    if (prevGood || nextGood) {
+      out.push(seg);
+    } else {
+      console.log(
+        `[Matcher] Context-drop: seg [${seg.shortStart.toFixed(2)}–` +
+        `${seg.shortEnd.toFixed(2)}s] conf ${seg.confidence.toFixed(1)}%` +
+        ` frameCount=${seg.frameCount} — no valid context neighbour.`
+      );
+      // frames left free → appear in unmatchedRanges
+    }
+  }
+  return out;
+}
 
 /**
  * Merge consecutive segments where:
@@ -865,7 +969,7 @@ export async function groundMatchedSegments(
   shortFps: FPData[],
   movieFps: FPData[],
   minSimilarity = 82,
-  minConsecutiveFrames = 9,
+  minConsecutiveFrames = 10,
   frameDrift = 3
 ): Promise<MatchResult> {
   if (shortFps.length === 0 || movieFps.length === 0) {
@@ -1002,7 +1106,9 @@ export async function groundMatchedSegments(
   // segment for them produces spurious 1–4 frame segments with random movie
   // times.  Skip them; they'll become tiny "unmatched" ranges (< 0.2 s) which
   // are invisible to the user.
-  const MIN_FORCED_FRAMES = 6;
+  // Minimum 10 frames = reference algorithm's stated threshold for a valid segment.
+  // Smaller leftovers are almost always false-cut fragments or CGI/altered content.
+  const MIN_FORCED_FRAMES = 10;
   let pass3Count = 0;
 
   for (const chunk of chunks) {
@@ -1033,6 +1139,21 @@ export async function groundMatchedSegments(
         if (s > bestSim) { bestSim = s; bestMi = mi; }
       }
       bestOf.push({ si, mi: bestMi, sim: bestSim });
+    }
+
+    // Confidence gate: if even the best forced match is very weak, the content
+    // likely doesn't exist in the reference movie (e.g. CGI insert, green-screen
+    // overlay, third-party clip).  Leave it as an unmatched range rather than
+    // fabricating a low-quality segment.
+    const UNMATCHED_SIM_GATE = 65; // below this avg % → altered / unmatched
+    const avgForcedSim = bestOf.reduce((s, f) => s + f.sim, 0) / bestOf.length;
+    if (avgForcedSim < UNMATCHED_SIM_GATE) {
+      console.log(
+        `[Matcher] Pass 3 (unmatched): chunk [${chunk.start}–${chunk.end}]` +
+        ` avg sim ${avgForcedSim.toFixed(1)}% < ${UNMATCHED_SIM_GATE}%` +
+        ` — flagged as altered/unmatched content.`
+      );
+      continue; // frames stay free → reported in unmatchedRanges
     }
 
     // Group temporally-contiguous frames into sub-segments
@@ -1091,11 +1212,18 @@ export async function groundMatchedSegments(
 
   final.sort((a, b) => a.shortStart - b.shortStart);
 
+  // Context-aware validation: drop low-confidence segments that have no
+  // high-confidence neighbour confirming a consistent movie timeline.
+  const validated = contextValidateSegments(final);
+  if (validated.length !== final.length) {
+    console.log(`[Matcher] Context validation: dropped ${final.length - validated.length} segment(s).`);
+  }
+
   const tToSi = new Map<string, number>();
   shortFps.forEach((fp, si) => tToSi.set(fp.timestamp.toFixed(4), si));
 
   const usedFinal = new Uint8Array(shortFps.length);
-  for (const seg of final) {
+  for (const seg of validated) {
     for (const frame of seg.matchSequence) {
       const si = tToSi.get(frame.shortTime.toFixed(4));
       if (si !== undefined) usedFinal[si] = 1;
@@ -1104,6 +1232,6 @@ export async function groundMatchedSegments(
 
   const unmatchedRanges = computeUnmatched(shortFps, usedFinal);
 
-  console.log(`[Matcher] Final: ${final.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
-  return { segments: final, unmatchedRanges };
+  console.log(`[Matcher] Final: ${validated.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
+  return { segments: validated, unmatchedRanges };
 }
