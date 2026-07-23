@@ -101,9 +101,12 @@ const MAX_SEED_CANDIDATES = 8;
 /** Candidates closer than this many movie frames are merged (2 s @ 25 fps) */
 const SEED_SEPARATION = 50;
 
-/** Slope (speed-ratio) clamps for the speed-tolerant walk */
-const SLOPE_MIN = 0.33;
-const SLOPE_MAX = 3.0;
+/**
+ * Slope (speed-ratio) clamps for the speed-tolerant walk.
+ * Range covers CapCut's 0.1x super-slow-mo up to 8x fast-forward.
+ */
+const SLOPE_MIN = 0.1;
+const SLOPE_MAX = 8.0;
 
 /** aHash weight vs dHash weight when both are available */
 const A_WEIGHT = 0.55;
@@ -327,7 +330,31 @@ function normalizeColorGrid(cg: number[]): Float32Array {
   return out;
 }
 
-function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
+/**
+ * Horizontally flip a 4×4 spatial grid stored as a flat array.
+ * Used so signatureSim can compare a normal frame against a mirrored one.
+ * @param grid       Flat array: 16 cells × valuesPerCell
+ * @param vpc        Values per cell (3 for colorGrid RGB, 1 for skin/detail)
+ */
+function flipGrid4x4(grid: number[], vpc: number): number[] {
+  const out = grid.slice();
+  for (let row = 0; row < 4; row++) {
+    for (let col = 0; col < 2; col++) {
+      const mirrorCol = 3 - col;
+      const i1 = (row * 4 + col)       * vpc;
+      const i2 = (row * 4 + mirrorCol) * vpc;
+      for (let k = 0; k < vpc; k++) {
+        const tmp  = out[i1 + k];
+        out[i1 + k] = out[i2 + k];
+        out[i2 + k] = tmp;
+      }
+    }
+  }
+  return out;
+}
+
+/** Raw (non-mirror-aware) signature similarity — used internally. */
+function _signatureSimRaw(sig1: FrameSignature, sig2: FrameSignature): number {
   let total = 0, count = 0;
 
   if (sig1.colorGrid.length === 48 && sig2.colorGrid.length === 48) {
@@ -362,6 +389,30 @@ function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
     count++;
   }
   return count > 0 ? (total / count) * 100 : 50;
+}
+
+/**
+ * Mirror-aware signature similarity.
+ *
+ * The hash layer (84 % weight in frameSim) already detects horizontal flips via
+ * fhash/fdhash.  But the signature's colorGrid / skinScoreGrid / detailGrid are
+ * spatial 4×4 grids — a mirrored clip has its columns reversed, causing a false
+ * mismatch at this layer.  We compare both the normal and the horizontally-
+ * flipped version of sig2's grids and keep whichever is higher.
+ */
+function signatureSim(sig1: FrameSignature, sig2: FrameSignature): number {
+  const normal = _signatureSimRaw(sig1, sig2);
+
+  // Only bother flipping if the colorGrid is the expected 4×4×3 = 48 values
+  if (sig2.colorGrid.length !== 48) return normal;
+
+  const sig2Flipped: FrameSignature = {
+    colorGrid:     flipGrid4x4(sig2.colorGrid,     3),
+    skinScoreGrid: flipGrid4x4(sig2.skinScoreGrid, 1),
+    detailGrid:    flipGrid4x4(sig2.detailGrid,    1),
+  };
+  const mirrored = _signatureSimRaw(sig1, sig2Flipped);
+  return Math.max(normal, mirrored);
 }
 
 function temporalSim(sSet: PreSet, si: number, mSet: PreSet, mi: number): number {
