@@ -51,6 +51,16 @@ export interface MatchedSegment {
   isApproximate: boolean;
   /** Short-clip frames skipped due to low confidence within this segment */
   gapCount: number;
+  /**
+   * Effective speed ratio of the short clip relative to the reference movie.
+   * Computed via linear regression over the full match sequence.
+   *   1.0  = normal speed
+   *   0.5  = 0.5× slow-mo (editor slowed clip → clip is longer than movie section)
+   *   2.0  = 2× fast-forward (editor sped up clip → clip is shorter than movie section)
+   * movieEnd is corrected using this ratio so it always reflects the actual
+   * reference-movie span, not just the raw last-matched frame.
+   */
+  speedRatio: number;
   matchSequence: Array<{
     shortTime: number;
     movieTime: number;
@@ -634,7 +644,8 @@ function estimateSlope(seq: RawSeq[], seedSi: number, seedMi: number): number {
   const pts: Array<{ si: number; mi: number }> = [{ si: seedSi, mi: seedMi }];
   const start = Math.max(0, seq.length - 25);
   for (let i = start; i < seq.length; i++) pts.push({ si: seq[i].si, mi: seq[i].mi });
-  if (pts.length < 8) return 1;
+  // Lowered from 8 → 4 so slope converges faster for short slow-mo sequences
+  if (pts.length < 4) return 1;
 
   let minSi = Infinity, maxSi = -Infinity, minPt = pts[0], maxPt = pts[0];
   for (const p of pts) {
@@ -642,10 +653,40 @@ function estimateSlope(seq: RawSeq[], seedSi: number, seedMi: number): number {
     if (p.si > maxSi) { maxSi = p.si; maxPt = p; }
   }
   const siSpan = maxPt.si - minPt.si;
-  if (siSpan < 6) return 1;
+  // Lowered from 6 → 3 to allow early detection of duplicate frames (slow-mo)
+  if (siSpan < 3) return 1;
   const slope = (maxPt.mi - minPt.mi) / siSpan;
   if (!isFinite(slope)) return 1;
   return Math.min(SLOPE_MAX, Math.max(SLOPE_MIN, slope));
+}
+
+/**
+ * Linear-regression slope of movie-frame index vs short-frame index over a
+ * complete walk sequence.  Returns Δmi / Δsi — the effective speed ratio:
+ *   1.0 = normal speed
+ *   0.5 = 0.5× slow-mo (editor slowed clip; clip is longer than movie section)
+ *   2.0 = 2× fast-forward (editor sped clip up; clip is shorter)
+ *
+ * Regression over ALL matched frames is more robust than just using the first
+ * and last points, which are sensitive to noise in the walk endpoints.
+ */
+function computeRegressionSlope(seq: RawSeq[]): number {
+  if (seq.length < 2) return 1.0;
+  if (seq.length === 2) {
+    const span = seq[1].si - seq[0].si;
+    if (span === 0) return 1.0;
+    return Math.max(SLOPE_MIN, Math.min(SLOPE_MAX, (seq[1].mi - seq[0].mi) / span));
+  }
+  let n = 0, sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+  for (const p of seq) {
+    sumX  += p.si;        sumY  += p.mi;
+    sumXX += p.si * p.si; sumXY += p.si * p.mi;
+    n++;
+  }
+  const denom = n * sumXX - sumX * sumX;
+  if (Math.abs(denom) < 1e-9) return 1.0;
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  return Math.max(SLOPE_MIN, Math.min(SLOPE_MAX, slope));
 }
 
 /**
@@ -836,6 +877,29 @@ function acceptSegment(
     if (!inSeq.has(g)) gapCount++;
   }
 
+  // ── Speed-ratio correction ────────────────────────────────────────────────
+  // Compute Δmi/Δsi via linear regression over the full matched sequence.
+  // This is more robust than using just the first/last endpoints, which are
+  // sensitive to walk-endpoint noise and optical-flow interpolation artifacts.
+  //
+  // Examples:
+  //   regSlope ≈ 1.0 → normal speed
+  //   regSlope ≈ 0.5 → clip was slowed 0.5× (3 s clip from 1.5 s of movie)
+  //   regSlope ≈ 2.0 → clip was sped up 2× (1.5 s clip from 3 s of movie)
+  const speedRatio = computeRegressionSlope(seq);
+
+  // Use regression to predict the correct movie endpoint rather than trusting
+  // the raw last-matched frame, which may be off when the walk slope drifted.
+  const siSpan       = lastSi - firstSi;
+  const rawMiEnd     = seq[seq.length - 1].mi;
+  const regMiEnd     = seq[0].mi + Math.round(speedRatio * siSpan);
+  const clampedMiEnd = Math.max(0, Math.min(movieFps.length - 1, regMiEnd));
+
+  // Only adopt the regression-corrected endpoint when it differs meaningfully
+  // from the raw walk endpoint (> 1 frame) — avoids unnecessary jitter on
+  // normal-speed content where the walk endpoint is already accurate.
+  const miEnd = Math.abs(regMiEnd - rawMiEnd) > 1 ? clampedMiEnd : rawMiEnd;
+
   // Find best frame for detail computation
   let bestFrameDetail: FrameDetail | undefined;
   if (sSet && mSet) {
@@ -850,11 +914,12 @@ function acceptSegment(
     shortStart: shortFps[firstSi].timestamp,
     shortEnd:   shortFps[lastSi].timestamp,
     movieStart: movieFps[seq[0].mi].timestamp,
-    movieEnd:   movieFps[seq[seq.length - 1].mi].timestamp,
+    movieEnd:   movieFps[miEnd].timestamp,
     confidence: avgConf,
     frameCount: seq.length,
     isApproximate,
     gapCount,
+    speedRatio,
     matchSequence: seq.map(f => ({
       shortTime: shortFps[f.si].timestamp,
       movieTime: movieFps[f.mi].timestamp,
@@ -979,6 +1044,8 @@ function mergeAdjacentSegments(segs: MatchedSegment[]): MatchedSegment[] {
         confidence: (cur.confidence * cur.frameCount + nxt.confidence * nxt.frameCount) / totalFrames,
         isApproximate: cur.isApproximate || nxt.isApproximate,
         gapCount:   cur.gapCount + nxt.gapCount + Math.round(shortGap * 25),
+        // Weighted average speed ratio from both halves
+        speedRatio: (cur.speedRatio * cur.frameCount + nxt.speedRatio * nxt.frameCount) / totalFrames,
         matchSequence:  [...cur.matchSequence, ...nxt.matchSequence],
         bestFrameDetail: (cur.bestFrameDetail && nxt.bestFrameDetail)
           ? (cur.confidence >= nxt.confidence ? cur.bestFrameDetail : nxt.bestFrameDetail)

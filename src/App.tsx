@@ -31,6 +31,12 @@ interface MatchedSegment {
   frameCount: number;
   isApproximate: boolean;
   gapCount?: number;
+  /**
+   * Effective speed ratio of the short clip vs the reference movie.
+   * 1.0 = normal speed · 0.5 = slowed (clip longer than movie section) · 2.0 = sped up
+   * Computed via linear regression over matchSequence in the server engine.
+   */
+  speedRatio?: number;
   matchSequence: Array<{ shortTime: number; movieTime: number; similarity: number }>;
   bestFrameDetail?: FrameDetail;
 }
@@ -397,13 +403,15 @@ export default function App() {
           if (sim > bestSim) { bestSim = sim; bestMi = mi; }
         }
 
+        // Browser mode: rough best-frame match only — no walk, so speed ratio
+        // is unknown. movieEnd is estimated assuming normal speed (1:1 frames).
         setSegments([{
           shortStart: targetFps[0]?.timestamp ?? 0,
           shortEnd:   targetFps[targetFps.length - 1]?.timestamp ?? 0,
           movieStart: refFps[bestMi]?.timestamp ?? 0,
           movieEnd:   refFps[Math.min(refFps.length - 1, bestMi + targetFps.length)]?.timestamp ?? 0,
           confidence: bestSim, frameCount: targetFps.length,
-          isApproximate: true, matchSequence: []
+          isApproximate: true, speedRatio: 1, matchSequence: []
         }]);
         setIsMatching(false);
         setStatus('Browser matching complete.');
@@ -893,11 +901,27 @@ export default function App() {
                           </div>
                         </td>
 
-                        {/* Duration */}
+                        {/* Duration + Speed ratio */}
                         <td className="px-4 py-3">
                           <div className="font-mono text-xs text-slate-400">
                             <div>{fmtDur(clipDur)} clip</div>
                             <div className="text-slate-600">{fmtDur(movieDur)} movie</div>
+                            {seg.speedRatio !== undefined && Math.abs(seg.speedRatio - 1) > 0.08 && (
+                              <div
+                                title={
+                                  seg.speedRatio < 1
+                                    ? `Clip was slowed ~${(1 / seg.speedRatio).toFixed(2)}× — movie section is shorter than clip`
+                                    : `Clip was sped up ~${seg.speedRatio.toFixed(2)}× — movie section is longer than clip`
+                                }
+                                className={`mt-0.5 font-semibold ${
+                                  seg.speedRatio < 0.92
+                                    ? 'text-blue-400'   // slow-mo
+                                    : 'text-amber-400'  // fast-forward
+                                }`}
+                              >
+                                {seg.speedRatio.toFixed(2)}× speed
+                              </div>
+                            )}
                           </div>
                         </td>
 
