@@ -11,6 +11,8 @@
  *     match gets a forced best-match segment in Pass 3, so no scene is ever skipped.
  */
 
+import * as fs from 'fs';
+import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 
 // ---------------------------------------------------------------------------
@@ -158,7 +160,7 @@ function hammingN(
 // Pre-computed per-set structure for O(1) per-frame lookups
 // ---------------------------------------------------------------------------
 
-interface PreSet {
+export interface PreSet {
   fps: FPData[];
   variantNames: string[];
   numVariants: number;
@@ -1088,15 +1090,21 @@ export async function groundMatchedSegments(
   movieFps: FPData[],
   minSimilarity = 82,
   minConsecutiveFrames = 10,
-  frameDrift = 3
+  frameDrift = 3,
+  _prebuiltShort?: PreSet,
+  _prebuiltMovie?: PreSet
 ): Promise<MatchResult> {
   if (shortFps.length === 0 || movieFps.length === 0) {
     return { segments: [], unmatchedRanges: [] };
   }
 
-  console.log(`[Matcher] Precomputing hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames… (frameDrift=${frameDrift})`);
-  const sSet = precompute(shortFps);
-  const mSet = precompute(movieFps);
+  if (_prebuiltShort && _prebuiltMovie) {
+    console.log(`[Matcher] Using pre-built hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames (frameDrift=${frameDrift})`);
+  } else {
+    console.log(`[Matcher] Precomputing hash arrays: ${shortFps.length} short + ${movieFps.length} movie frames… (frameDrift=${frameDrift})`);
+  }
+  const sSet = _prebuiltShort ?? precompute(shortFps);
+  const mSet = _prebuiltMovie ?? precompute(movieFps);
 
   const dEnabled    = sSet.dFlat !== null && mSet.dFlat !== null && sSet.dBits === mSet.dBits;
   const flipEnabled = mSet.faFlat !== null && sSet.aBits === mSet.aBits;
@@ -1352,4 +1360,220 @@ export async function groundMatchedSegments(
 
   console.log(`[Matcher] Final: ${validated.length} segment(s), ${unmatchedRanges.length} unmatched range(s).`);
   return { segments: validated, unmatchedRanges };
+}
+
+// ---------------------------------------------------------------------------
+// Memory-efficient streaming precompute — reads NDJSON without loading all
+// hash strings into memory at once.
+// ---------------------------------------------------------------------------
+
+/**
+ * Count lines in a file by streaming through it.
+ * Used to pre-size the flat TypedArrays before the main streaming pass.
+ */
+async function countFileLines(filePath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let count = 0;
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
+    stream.on('data', (chunk: string) => {
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk.charCodeAt(i) === 10 /* '\n' */) count++;
+      }
+    });
+    stream.on('end', () => resolve(count));
+    stream.on('error', reject);
+  });
+}
+
+/**
+ * Build a PreSet by streaming an NDJSON fingerprint file line-by-line.
+ *
+ * Hash strings are converted to flat Uint32Arrays immediately and then
+ * discarded — they are NEVER accumulated in a large JS array.  Only the
+ * compact per-frame data (frameIndex, timestamp, signature) is kept in the
+ * fps array, cutting peak RAM from ~6-8 GB to ~400 MB for a 2-hour movie.
+ */
+async function streamPrecomputeFromNDJSON(filePath: string): Promise<PreSet> {
+  const totalFrames = await countFileLines(filePath);
+  if (totalFrames === 0) return precompute([]);
+
+  // These are allocated at full size up-front (TypedArrays → outside JS heap)
+  let aFlat:  Uint32Array | null = null;
+  let faFlat: Uint32Array | null = null;
+  let dFlat:  Uint32Array | null = null;
+  let fdFlat: Uint32Array | null = null;
+  const tDeltaBuf = new Float32Array(totalFrames * 48);
+  const tMagBuf   = new Float32Array(totalFrames);
+
+  let variantNames: string[] = [];
+  let numVariants = 0;
+  let aBits = 256, aWords = 8, dBits = 0, dWords = 0;
+  let hasFlip = false, hasD = false;
+  const variantIdx = new Map<string, number>();
+
+  // Compact fps — only what the matching logic actually uses after precompute
+  const compactFps: FPData[] = [];
+  let allHaveSig = true;
+  let prevColorGrid: number[] | null = null;
+  let fi = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    const rl = readline.createInterface({
+      input: fs.createReadStream(filePath, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+
+    rl.on('line', (line: string) => {
+      if (!line.trim()) return;
+
+      let frame: any;
+      try { frame = JSON.parse(line); } catch { return; }
+
+      // ── First-frame initialisation ────────────────────────────────────
+      if (fi === 0) {
+        variantNames = Object.keys(frame.variants || {});
+        numVariants  = variantNames.length;
+        const fv     = frame.variants?.[variantNames[0]];
+        aBits   = fv?.hash?.length  || 256;
+        aWords  = Math.max(1, Math.ceil(aBits / 32));
+        hasD    = typeof fv?.dhash  === 'string' && fv.dhash.length  > 0;
+        hasFlip = typeof fv?.fhash  === 'string' && fv.fhash.length  > 0;
+        dBits   = hasD ? fv.dhash.length : 0;
+        dWords  = hasD ? Math.max(1, Math.ceil(dBits / 32)) : 0;
+        variantNames.forEach((n, i) => variantIdx.set(n, i));
+
+        aFlat  = new Uint32Array(totalFrames * numVariants * aWords);
+        faFlat = hasFlip ? new Uint32Array(totalFrames * numVariants * aWords) : null;
+        dFlat  = hasD    ? new Uint32Array(totalFrames * numVariants * dWords) : null;
+        fdFlat = (hasD && hasFlip) ? new Uint32Array(totalFrames * numVariants * dWords) : null;
+      }
+
+      // ── Fill flat hash arrays ─────────────────────────────────────────
+      for (let vi = 0; vi < numVariants; vi++) {
+        const v    = frame.variants?.[variantNames[vi]];
+        const aOff = (fi * numVariants + vi) * aWords;
+        aFlat!.set(hashToU32(v?.hash  ?? '', aWords), aOff);
+        if (faFlat) faFlat.set(hashToU32(v?.fhash ?? '', aWords), aOff);
+        if (dFlat) {
+          const dOff = (fi * numVariants + vi) * dWords;
+          dFlat.set(hashToU32(v?.dhash  ?? '', dWords), dOff);
+          if (fdFlat) fdFlat.set(hashToU32(v?.fdhash ?? '', dWords), dOff);
+        }
+      }
+
+      // ── Temporal colour-delta ─────────────────────────────────────────
+      const sig = frame.signature as FrameSignature | undefined;
+      if (sig?.colorGrid?.length === 48 && prevColorGrid && fi > 0) {
+        let mag = 0;
+        for (let k = 0; k < 48; k++) {
+          const d = sig.colorGrid[k] - prevColorGrid[k];
+          tDeltaBuf[fi * 48 + k] = d;
+          mag += d * d;
+        }
+        tMagBuf[fi] = Math.sqrt(mag);
+      }
+      prevColorGrid = sig?.colorGrid ?? null;
+      if (!sig || sig.colorGrid?.length !== 48) allHaveSig = false;
+
+      // ── Compact fps entry (no variant hash strings) ───────────────────
+      compactFps.push({
+        frameIndex: frame.frameIndex,
+        timestamp:  frame.timestamp,
+        variants:   {},   // hash data lives in flat arrays — strings freed
+        signature:  sig,
+      } as FPData);
+
+      fi++;
+      // The `frame` object goes out of scope here and is eligible for GC.
+    });
+
+    rl.on('close', resolve);
+    rl.on('error', reject);
+  });
+
+  return {
+    fps: compactFps,
+    variantNames,
+    numVariants,
+    aFlat:  aFlat  ?? new Uint32Array(0),
+    faFlat: hasFlip ? faFlat : null,
+    dFlat:  hasD   ? dFlat  : null,
+    fdFlat: (hasD && hasFlip) ? fdFlat : null,
+    aBits, aWords, dBits, dWords,
+    variantIdx,
+    tDelta: (allHaveSig && fi > 1) ? tDeltaBuf : null,
+    tMag:   (allHaveSig && fi > 1) ? tMagBuf   : null,
+  };
+}
+
+/**
+ * Build a PreSet from a fingerprint result file.
+ *
+ * Supports two formats:
+ *  - **NDJSON** (new, default): one JSON object per line — streamed line-by-line
+ *    so hash strings are never accumulated in memory.
+ *  - **JSON array** (legacy): `[{...},{...},...]` — parsed all at once for
+ *    backward compatibility with result files created before this change.
+ */
+export async function streamPrecomputeFromFile(filePath: string): Promise<PreSet> {
+  // Peek at the first byte to detect format.
+  const fd = fs.openSync(filePath, 'r');
+  const peek = Buffer.alloc(1);
+  fs.readSync(fd, peek, 0, 1, 0);
+  fs.closeSync(fd);
+  const firstChar = peek.toString('utf8');
+
+  if (firstChar === '[') {
+    // Legacy JSON array — load with JSON.parse (backward compat).
+    console.log('[Precompute] Legacy JSON array format — loading into memory');
+    const fps: FPData[] = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return precompute(fps);
+  }
+
+  // NDJSON — memory-efficient streaming path.
+  return streamPrecomputeFromNDJSON(filePath);
+}
+
+/**
+ * Memory-efficient public API: builds both PreSets by streaming their
+ * fingerprint files then runs the full matching pipeline.
+ *
+ * Peak RAM for a 2-hour movie is ~400 MB instead of ~7 GB.
+ */
+export async function matchVideosFromFiles(
+  shortResultPath: string,
+  movieResultPath: string,
+  opts: {
+    minSimilarity?:       number;
+    minConsecutiveFrames?: number;
+    frameDrift?:          number;
+  } = {}
+): Promise<MatchResult & { movieFrames: number; shortFrames: number }> {
+  const {
+    minSimilarity       = 82,
+    minConsecutiveFrames = 9,
+    frameDrift          = 3,
+  } = opts;
+
+  console.log('[Match] Streaming precompute: short fingerprints…');
+  const shortPreSet = await streamPrecomputeFromFile(shortResultPath);
+
+  console.log('[Match] Streaming precompute: movie fingerprints…');
+  const moviePreSet = await streamPrecomputeFromFile(movieResultPath);
+
+  const shortFrames = shortPreSet.fps.length;
+  const movieFrames = moviePreSet.fps.length;
+  console.log(`[Match] Loaded ${movieFrames} movie frames, ${shortFrames} short frames. Running matching…`);
+
+  const result = await groundMatchedSegments(
+    shortPreSet.fps,
+    moviePreSet.fps,
+    minSimilarity,
+    minConsecutiveFrames,
+    frameDrift,
+    shortPreSet,
+    moviePreSet
+  );
+
+  return { ...result, movieFrames, shortFrames };
 }

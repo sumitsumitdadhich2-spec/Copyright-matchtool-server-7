@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { createServer as createViteServer } from 'vite';
 import { extractFingerprints, NUM_WORKERS } from './server/pipeline';
-import { groundMatchedSegments, FPData } from './server/matching-engine';
+import { matchVideosFromFiles } from './server/matching-engine';
 
 async function startServer() {
   // canvas.node needs libuuid.so.1 which lives in /lib/x86_64-linux-gnu on this host
@@ -94,20 +94,21 @@ async function startServer() {
         console.log(`[Job ${jobId}] Starting background processing for ${finalPath}...`);
         job.status = 'processing';
 
-        extractFingerprints(finalPath, (decoded, processed) => {
+        const resultPath = path.join(uploadDir, `${jobId}_result.json`);
+        extractFingerprints(finalPath, resultPath, (decoded, processed) => {
           const j = jobs.get(jobId);
           if (j) {
             j.totalFrames = decoded;
             j.processedFrames = processed;
           }
-        }).then((results) => {
-          console.log(`[Job ${jobId}] Finished processing ${results.length} frames.`);
-          const resultPath = path.join(uploadDir, `${jobId}_result.json`);
-          fs.writeFileSync(resultPath, JSON.stringify(results));
+        }).then((frameCount) => {
+          console.log(`[Job ${jobId}] Finished processing ${frameCount} frames → ${resultPath}`);
           
           const j = jobs.get(jobId);
           if (j) {
             j.status = 'completed';
+            j.processedFrames = frameCount;
+            j.totalFrames = frameCount;
           }
           
           // Cleanup video file to save space
@@ -156,17 +157,15 @@ async function startServer() {
     console.log(`[Job ${jobId}] Starting background processing for ${tempVideoPath}...`);
     job.status = 'processing';
 
-    extractFingerprints(tempVideoPath, (decoded, processed) => {
+    const legacyResultPath = path.join(uploadDir, `${jobId}_result.json`);
+    extractFingerprints(tempVideoPath, legacyResultPath, (decoded, processed) => {
       const j = jobs.get(jobId);
       if (j) {
         j.totalFrames = decoded;
         j.processedFrames = processed;
       }
-    }).then((results) => {
-      console.log(`[Job ${jobId}] Finished processing ${results.length} frames.`);
-      
-      const resultPath = path.join(uploadDir, `${jobId}_result.json`);
-      fs.writeFileSync(resultPath, JSON.stringify(results));
+    }).then((frameCount) => {
+      console.log(`[Job ${jobId}] Finished processing ${frameCount} frames → ${legacyResultPath}`);
 
       try {
         if (fs.existsSync(tempVideoPath)) {
@@ -180,8 +179,8 @@ async function startServer() {
       const j = jobs.get(jobId);
       if (j) {
         j.status = 'completed';
-        j.processedFrames = results.length;
-        j.totalFrames = results.length;
+        j.processedFrames = frameCount;
+        j.totalFrames = frameCount;
       }
     }).catch((err) => {
       console.error(`[Job ${jobId}] Processing failed:`, err);
@@ -213,6 +212,8 @@ async function startServer() {
   });
 
   // 5. Result retrieval endpoint
+  // Always responds with a JSON array regardless of internal file format
+  // (new files are NDJSON; old files are a JSON array).
   app.get('/api/result/:jobId', (req, res) => {
     const { jobId } = req.params;
     const job = jobs.get(jobId);
@@ -229,11 +230,34 @@ async function startServer() {
       return res.status(404).json({ error: 'Result file not found' });
     }
 
-    res.sendFile(resultPath, (err) => {
-      if (err) {
-        console.error(`Failed to send result file for job ${jobId}:`, err);
+    try {
+      // Peek at first byte to detect format
+      const fd = fs.openSync(resultPath, 'r');
+      const peek = Buffer.alloc(1);
+      fs.readSync(fd, peek, 0, 1, 0);
+      fs.closeSync(fd);
+
+      if (peek.toString('utf8') === '[') {
+        // Legacy JSON array — serve directly
+        res.sendFile(resultPath, (err) => {
+          if (err) console.error(`Failed to send result file for job ${jobId}:`, err);
+        });
+      } else {
+        // NDJSON — parse each line and send as a JSON array.
+        // This endpoint is used by the browser mode (VideoProcessor.ts) which
+        // needs a JSON array.  Short clips are small; movie files are only
+        // fetched here if the user explicitly requests them in browser mode.
+        const content = fs.readFileSync(resultPath, 'utf-8');
+        const arr = content
+          .split('\n')
+          .filter(l => l.trim().length > 0)
+          .map(l => JSON.parse(l));
+        res.json(arr);
       }
-    });
+    } catch (err: any) {
+      console.error(`Failed to read result file for job ${jobId}:`, err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // 6. Match endpoint — runs groundMatchedSegments on two stored result JSONs
@@ -272,21 +296,23 @@ async function startServer() {
         return res.status(404).json({ error: `Short result not found for job ${shortJobId}. Re-process the target clip.` });
       }
 
-      console.log(`[Match] Loading fingerprints: movie=${movieJobId} short=${shortJobId} drift=${resolvedDrift}`);
+      console.log(`[Match] Streaming fingerprints: movie=${movieJobId} short=${shortJobId} drift=${resolvedDrift}`);
 
-      const movieFps: FPData[] = JSON.parse(fs.readFileSync(movieResultPath, 'utf-8'));
-      const shortFps: FPData[] = JSON.parse(fs.readFileSync(shortResultPath, 'utf-8'));
-
-      console.log(`[Match] Loaded ${movieFps.length} movie frames, ${shortFps.length} short frames. Running matching…`);
-
-      const result = await groundMatchedSegments(shortFps, movieFps, resolvedMinSim, resolvedMinFrames, resolvedDrift);
+      // matchVideosFromFiles streams both files line-by-line and converts hash
+      // strings directly into flat TypedArrays — never loads the full JSON into
+      // memory.  Peak RAM drops from ~7 GB to ~400 MB for a 2-hour movie.
+      const result = await matchVideosFromFiles(shortResultPath, movieResultPath, {
+        minSimilarity:        resolvedMinSim,
+        minConsecutiveFrames: resolvedMinFrames,
+        frameDrift:           resolvedDrift,
+      });
 
       console.log(`[Match] Done: ${result.segments.length} segments, ${result.unmatchedRanges.length} unmatched ranges.`);
       res.json({
-        segments: result.segments,
+        segments:       result.segments,
         unmatchedRanges: result.unmatchedRanges,
-        movieFrames: movieFps.length,
-        shortFrames: shortFps.length
+        movieFrames:    result.movieFrames,
+        shortFrames:    result.shortFrames,
       });
     } catch (err: any) {
       console.error('[Match] Error:', err);

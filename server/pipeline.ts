@@ -2,6 +2,7 @@ import { spawn, execSync } from 'child_process';
 import { Worker } from 'worker_threads';
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
 import { fileURLToPath } from 'url';
 import { FrameSignature } from '../src/shared/fingerprint';
 
@@ -24,6 +25,18 @@ const currentDirname = getDirname();
 
 export const NUM_WORKERS = Math.max(1, Math.min(os.cpus().length, 128));
 
+// ---------------------------------------------------------------------------
+// How often to attempt a flush (every N processed frames)
+// ---------------------------------------------------------------------------
+const FLUSH_EVERY = 100;
+
+// Flush when contiguous completed frames in Map >= this many
+const FLUSH_BATCH = 1500;
+
+// Flush when process RSS exceeds this (bytes).  5.5 GB gives headroom below
+// the user's 6 GB limit while still leaving room for the OS + workers.
+const RAM_FLUSH_THRESHOLD_BYTES = 5.5 * 1024 * 1024 * 1024;
+
 export interface FingerprintResult {
   frameIndex: number;
   timestamp: number;
@@ -31,10 +44,20 @@ export interface FingerprintResult {
   signature?: FrameSignature;
 }
 
+/**
+ * Extract per-frame fingerprints from a video file and write them as NDJSON
+ * (one JSON object per line) directly to `outputPath`.
+ *
+ * RAM usage is kept low by flushing completed frames to disk as they arrive,
+ * rather than accumulating the entire fingerprint set in memory until the end.
+ *
+ * @returns Promise that resolves with the total frame count once done.
+ */
 export function extractFingerprints(
   videoPath: string,
+  outputPath: string,
   onProgress?: (decoded: number, processed: number) => void
-): Promise<FingerprintResult[]> {
+): Promise<number> {
   return new Promise((resolve, reject) => {
     const workers: Worker[] = [];
     let idleWorkers: Worker[] = [];
@@ -42,12 +65,60 @@ export function extractFingerprints(
     let taskIdCounter = 0;
     let decoded = 0;
     let processed = 0;
-    // Each entry: { variants, signature? }
+    // Holds frames that have been computed but not yet written to disk.
     const fingerprints = new Map<number, { variants: any; signature?: FrameSignature }>();
     const taskQueue: { id: number; frameBuffer: Buffer; width: number; height: number; frameIndex: number }[] = [];
     let ffmpegProcess: any = null;
     let isFinished = false;
 
+    // Track the highest frame index already written to disk.
+    let lastFlushedFrame = 0;
+
+    // ── Write stream ─────────────────────────────────────────────────────────
+    let writeStreamErr: Error | null = null;
+    const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf8' });
+    writeStream.on('error', (err) => { writeStreamErr = err; });
+
+    // ── Flush helper ─────────────────────────────────────────────────────────
+    /**
+     * Write the longest contiguous run of completed frames (starting at
+     * lastFlushedFrame+1) to disk, then delete them from the Map.
+     *
+     * Called periodically from the worker message handler and once more
+     * (force=true) after all frames are done.
+     */
+    function flushToStream(force = false): void {
+      const rss = process.memoryUsage().rss;
+      const shouldFlush =
+        force ||
+        rss >= RAM_FLUSH_THRESHOLD_BYTES ||
+        fingerprints.size >= FLUSH_BATCH;
+      if (!shouldFlush) return;
+
+      // Walk forward from the last flushed position while frames are present.
+      let hi = lastFlushedFrame;
+      while (fingerprints.has(hi + 1)) hi++;
+      if (hi === lastFlushedFrame) return; // nothing contiguous to flush
+
+      const FRAME_RATE = 25;
+      for (let i = lastFlushedFrame + 1; i <= hi; i++) {
+        const fp = fingerprints.get(i);
+        if (fp) {
+          const line =
+            JSON.stringify({
+              frameIndex: i,
+              timestamp: (i - 1) / FRAME_RATE,
+              variants: fp.variants,
+              signature: fp.signature
+            }) + '\n';
+          writeStream.write(line);
+          fingerprints.delete(i); // free memory
+        }
+      }
+      lastFlushedFrame = hi;
+    }
+
+    // ── Worker lifecycle ─────────────────────────────────────────────────────
     const cleanupWorkers = () => {
       for (const w of workers) {
         w.terminate().catch(() => {});
@@ -72,15 +143,15 @@ export function extractFingerprints(
 
     try {
       const isProd = process.env.NODE_ENV === 'production';
-      const workerPath = isProd 
+      const workerPath = isProd
         ? path.join(currentDirname, 'worker.cjs')
         : path.join(currentDirname, 'worker.ts');
-      
+
       for (let i = 0; i < NUM_WORKERS; i++) {
         const worker = new Worker(workerPath, isProd ? {} : {
           execArgv: ['-r', 'tsx/cjs']
         });
-        
+
         worker.on('message', (msg) => {
           idleWorkers.push(worker);
           const task = activeTasks.get(msg.id);
@@ -95,6 +166,10 @@ export function extractFingerprints(
                 onProgress(decoded, processed);
               }
             }
+          }
+          // Periodically attempt to flush completed frames to disk.
+          if (processed % FLUSH_EVERY === 0) {
+            flushToStream();
           }
           assignTasks();
         });
@@ -112,7 +187,7 @@ export function extractFingerprints(
         idleWorkers.push(worker);
       }
 
-      // Query video dimensions via ffprobe
+      // ── Query video dimensions via ffprobe ───────────────────────────────
       let width = 0;
       let height = 0;
       try {
@@ -202,19 +277,16 @@ export function extractFingerprints(
               isFinished = true;
               cleanupWorkers();
 
-              const sortedFp: FingerprintResult[] = [];
-              for (let i = 1; i <= decoded; i++) {
-                const fp = fingerprints.get(i);
-                if (fp) {
-                  sortedFp.push({
-                    frameIndex: i,
-                    timestamp: (i - 1) / 25,
-                    variants: fp.variants,
-                    signature: fp.signature
-                  });
+              // Final flush — write any frames still in the Map.
+              flushToStream(true);
+
+              writeStream.end(() => {
+                if (writeStreamErr) {
+                  reject(writeStreamErr);
+                } else {
+                  resolve(decoded);
                 }
-              }
-              resolve(sortedFp);
+              });
             }
           }
         }, 100);

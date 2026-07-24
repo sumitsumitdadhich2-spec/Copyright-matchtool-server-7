@@ -7,22 +7,21 @@
  */
 import * as fs from 'fs';
 import { extractFingerprints } from './server/pipeline';
-import { groundMatchedSegments, FPData } from './server/matching-engine';
+import { streamPrecomputeFromFile, groundMatchedSegments, PreSet } from './server/matching-engine';
 
 const MOVIE = '/tmp/ref_movie.mp4';
 const SHORT = '/tmp/short_edited.mp4';
 const MOVIE_CACHE = '/tmp/ref_movie_fp.json';
 const SHORT_CACHE = '/tmp/short_edited_fp.json';
 
-async function getFps(video: string, cache: string): Promise<FPData[]> {
-  if (fs.existsSync(cache)) {
+async function getPreSet(video: string, cache: string): Promise<PreSet> {
+  if (!fs.existsSync(cache)) {
+    console.log(`[Test] Extracting fingerprints: ${video}`);
+    await extractFingerprints(video, cache);
+  } else {
     console.log(`[Test] Using cached fingerprints: ${cache}`);
-    return JSON.parse(fs.readFileSync(cache, 'utf-8'));
   }
-  console.log(`[Test] Extracting fingerprints: ${video}`);
-  const fps = await extractFingerprints(video);
-  fs.writeFileSync(cache, JSON.stringify(fps));
-  return fps;
+  return streamPrecomputeFromFile(cache);
 }
 
 const GROUND_TRUTH = [
@@ -32,12 +31,18 @@ const GROUND_TRUTH = [
 ];
 
 async function main() {
-  const movieFps = await getFps(MOVIE, MOVIE_CACHE);
-  const shortFps = await getFps(SHORT, SHORT_CACHE);
-  console.log(`[Test] movie=${movieFps.length} frames, short=${shortFps.length} frames`);
+  const moviePreSet = await getPreSet(MOVIE, MOVIE_CACHE);
+  const shortPreSet = await getPreSet(SHORT, SHORT_CACHE);
+  console.log(`[Test] movie=${moviePreSet.fps.length} frames, short=${shortPreSet.fps.length} frames`);
 
   const t0 = Date.now();
-  const result = await groundMatchedSegments(shortFps, movieFps, 82, 9);
+  // Pass pre-built PreSets so groundMatchedSegments skips the precompute step
+  // (empty variants in fps after streaming would otherwise produce wrong hashes).
+  const result = await groundMatchedSegments(
+    shortPreSet.fps, moviePreSet.fps,
+    82, 9, 3,
+    shortPreSet, moviePreSet
+  );
   console.log(`[Test] Matching took ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
   console.log('\n===== SEGMENTS =====');
