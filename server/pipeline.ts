@@ -37,6 +37,24 @@ const FLUSH_BATCH = 1500;
 // the user's 6 GB limit while still leaving room for the OS + workers.
 const RAM_FLUSH_THRESHOLD_BYTES = 5.5 * 1024 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// Checkpoint: save progress to disk every N frames flushed so processing can
+// resume after a server restart without re-processing from scratch.
+// ---------------------------------------------------------------------------
+const CHECKPOINT_EVERY = 5000;
+
+/** Options for resumable extraction */
+export interface ExtractionOptions {
+  /** Number of frames already written to outputPath from a previous run (0 = fresh start) */
+  resumeFrom?: number;
+  /** Full path of the checkpoint JSON file to create/update during processing */
+  checkpointPath?: string;
+  /** Job ID — stored in the checkpoint so server.ts can match it on resume */
+  jobId?: string;
+  /** "filename:filesize" key — stored in checkpoint for fast lookup */
+  checkpointKey?: string;
+}
+
 export interface FingerprintResult {
   frameIndex: number;
   timestamp: number;
@@ -56,8 +74,11 @@ export interface FingerprintResult {
 export function extractFingerprints(
   videoPath: string,
   outputPath: string,
-  onProgress?: (decoded: number, processed: number) => void
+  onProgress?: (decoded: number, processed: number) => void,
+  options: ExtractionOptions = {}
 ): Promise<number> {
+  const { resumeFrom = 0, checkpointPath, jobId, checkpointKey } = options;
+
   return new Promise((resolve, reject) => {
     const workers: Worker[] = [];
     let idleWorkers: Worker[] = [];
@@ -65,6 +86,8 @@ export function extractFingerprints(
     let taskIdCounter = 0;
     let decoded = 0;
     let processed = 0;
+    // Frames skipped at the start of a resumed run (already written in a previous run).
+    let skipped = 0;
     // Holds frames that have been computed but not yet written to disk.
     const fingerprints = new Map<number, { variants: any; signature?: FrameSignature }>();
     const taskQueue: { id: number; frameBuffer: Buffer; width: number; height: number; frameIndex: number }[] = [];
@@ -72,7 +95,12 @@ export function extractFingerprints(
     let isFinished = false;
 
     // Track the highest frame index already written to disk.
-    let lastFlushedFrame = 0;
+    // Initialised to resumeFrom so flushToStream starts writing from the right offset.
+    let lastFlushedFrame = resumeFrom;
+
+    // Checkpoint state — prevents concurrent writes and tracks last saved position.
+    let checkpointPending = false;
+    let lastCheckpointAt = resumeFrom; // lastFlushedFrame value at last checkpoint save
 
     // Set after ffprobe; controls how many raw-pixel frames we allow in the
     // task queue at once.  At 1 080p a frame is ~8 MB; at 4K it is ~33 MB.
@@ -82,8 +110,12 @@ export function extractFingerprints(
     let dynamicQueueLimit = 100; // default until ffprobe fills this in
 
     // ── Write stream ─────────────────────────────────────────────────────────
+    // Use append mode when resuming so already-written frames are preserved.
     let writeStreamErr: Error | null = null;
-    const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf8' });
+    const writeStream = fs.createWriteStream(outputPath, {
+      encoding: 'utf8',
+      flags: resumeFrom > 0 ? 'a' : 'w',
+    });
     writeStream.on('error', (err) => { writeStreamErr = err; });
 
     // ── Flush helper ─────────────────────────────────────────────────────────
@@ -123,6 +155,22 @@ export function extractFingerprints(
         }
       }
       lastFlushedFrame = hi;
+
+      // ── Async checkpoint write (non-blocking, every CHECKPOINT_EVERY frames) ─
+      // We write after lastFlushedFrame advances so the checkpoint always reflects
+      // data that is actually on disk. checkpointPending prevents concurrent writes.
+      if (
+        checkpointPath && jobId && checkpointKey &&
+        lastFlushedFrame - lastCheckpointAt >= CHECKPOINT_EVERY &&
+        !checkpointPending
+      ) {
+        lastCheckpointAt = lastFlushedFrame;
+        checkpointPending = true;
+        const cpData = JSON.stringify({ jobId, checkpointKey, updatedAt: Date.now() });
+        fs.promises.writeFile(checkpointPath, cpData)
+          .catch(e => console.error(`[Checkpoint] Write failed for ${jobId}:`, e))
+          .finally(() => { checkpointPending = false; });
+      }
     }
 
     // ── Worker lifecycle ─────────────────────────────────────────────────────
@@ -157,9 +205,13 @@ export function extractFingerprints(
 
     try {
       const isProd = process.env.NODE_ENV === 'production';
+      // In dev, import.meta.url is undefined under tsx ESM mode, so getDirname()
+      // falls back to process.cwd() (project root) — not server/.  Resolve
+      // explicitly from CWD so the path is always correct regardless of how
+      // tsx initialises import.meta.
       const workerPath = isProd
         ? path.join(currentDirname, 'worker.cjs')
-        : path.join(currentDirname, 'worker.ts');
+        : path.resolve(process.cwd(), 'server', 'worker.ts');
 
       for (let i = 0; i < NUM_WORKERS; i++) {
         const worker = new Worker(workerPath, isProd ? {} : {
@@ -177,7 +229,7 @@ export function extractFingerprints(
               processed++;
               task.resolve(msg.result);
               if (onProgress) {
-                onProgress(decoded, processed);
+                onProgress(decoded, processed + skipped);
               }
             }
           }
@@ -251,6 +303,20 @@ export function extractFingerprints(
           buffer = buffer.slice(frameSize);
 
           decoded++;
+
+          // ── Resume skip: discard frames already written in a previous run ──
+          // ffmpeg decodes from the start; we simply throw away raw pixel data
+          // for frames we already have.  No workers are involved, so fingerprint
+          // quality for the resumed portion is identical to a fresh run.
+          if (decoded <= resumeFrom) {
+            skipped++;
+            if (onProgress && skipped % 1000 === 0) {
+              onProgress(decoded, skipped); // show fast-forward progress
+            }
+            // Don't pause ffmpeg during skip — queue is empty, no backpressure.
+            continue;
+          }
+
           const id = ++taskIdCounter;
           const currentFrame = decoded;
 
@@ -264,7 +330,7 @@ export function extractFingerprints(
             console.error(`Error processing frame ${currentFrame}:`, err);
             processed++;
             if (onProgress) {
-              onProgress(decoded, processed);
+              onProgress(decoded, processed + skipped);
             }
           });
 
@@ -303,7 +369,7 @@ export function extractFingerprints(
 
       ffmpegProcess.on('close', (_code: any) => {
         const checkInterval = setInterval(() => {
-          if (processed >= decoded) {
+          if ((processed + skipped) >= decoded) {
             clearInterval(checkInterval);
             if (!isFinished) {
               isFinished = true;

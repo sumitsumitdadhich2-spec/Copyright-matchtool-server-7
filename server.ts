@@ -69,6 +69,47 @@ async function startServer() {
     return path.join(uploadDir, `${jobId}_meta.json`);
   }
 
+  function checkpointFilePath(jobId: string) {
+    return path.join(uploadDir, `${jobId}_checkpoint.json`);
+  }
+
+  /**
+   * Scan uploads/ for a checkpoint file whose checkpointKey matches
+   * "filename:filesize".  Returns the jobId of the incomplete job, or null.
+   */
+  function findCheckpoint(filename: string, fileSize: number): { jobId: string } | null {
+    if (!fs.existsSync(uploadDir)) return null;
+    const key = `${filename}:${fileSize}`;
+    for (const f of fs.readdirSync(uploadDir)) {
+      if (!f.endsWith('_checkpoint.json')) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(uploadDir, f), 'utf-8'));
+        if (data.checkpointKey === key) return { jobId: data.jobId };
+      } catch { /* corrupt — skip */ }
+    }
+    return null;
+  }
+
+  /**
+   * Count the number of complete (newline-terminated) lines in a file.
+   * Used to determine the exact resume frame index from a partial NDJSON result.
+   */
+  function countCompleteLines(filePath: string): number {
+    if (!fs.existsSync(filePath)) return 0;
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      let count = 0;
+      let pos = 0;
+      while (true) {
+        const nl = content.indexOf('\n', pos);
+        if (nl === -1) break; // trailing incomplete line — not counted
+        count++;
+        pos = nl + 1;
+      }
+      return count;
+    } catch { return 0; }
+  }
+
   function writeJobMeta(jobId: string, meta: JobMeta) {
     try {
       fs.writeFileSync(metaPath(jobId), JSON.stringify(meta));
@@ -156,18 +197,35 @@ async function startServer() {
       await fs.promises.unlink(chunkPath);
 
       if (parseInt(chunkIndex) === parseInt(totalChunks) - 1) {
-        // All chunks received, start job
-        const jobId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        // All chunks received — check for an existing incomplete checkpoint before
+        // creating a new job so we can resume rather than start from scratch.
+        const assembled = await fs.promises.stat(finalPath).catch(() => ({ size: 0 }));
+        const checkpointKey = `${filename}:${assembled.size}`;
+        const existingCp = findCheckpoint(filename, assembled.size);
+
+        let jobId: string;
+        let resumeFrom = 0;
+
+        if (existingCp) {
+          // Resume the interrupted job using the same jobId (so the result file path
+          // stays the same and we can append to it).
+          jobId = existingCp.jobId;
+          const partialResult = path.join(uploadDir, `${jobId}_result.json`);
+          resumeFrom = countCompleteLines(partialResult);
+          console.log(`[Job ${jobId}] Checkpoint found — resuming from frame ${resumeFrom} for "${filename}"`);
+        } else {
+          jobId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        }
+
         const job: Job = {
           id: jobId,
           status: 'pending',
           totalFrames: 0,
-          processedFrames: 0
+          processedFrames: resumeFrom, // show already-done frames immediately
         };
         jobs.set(jobId, job);
 
-        // Persist meta so we can recover after server restart
-        const assembled = await fs.promises.stat(finalPath).catch(() => ({ size: 0 }));
+        // Persist / refresh meta so we can recover after a future restart
         writeJobMeta(jobId, {
           originalName: filename,
           fileSize: assembled.size,
@@ -181,13 +239,15 @@ async function startServer() {
         job.status = 'processing';
 
         const resultPath = path.join(uploadDir, `${jobId}_result.json`);
+        const cpPath = checkpointFilePath(jobId);
+
         extractFingerprints(finalPath, resultPath, (decoded, processed) => {
           const j = jobs.get(jobId);
           if (j) {
             j.totalFrames = decoded;
             j.processedFrames = processed;
           }
-        }).then((frameCount) => {
+        }, { resumeFrom, checkpointPath: cpPath, jobId, checkpointKey }).then((frameCount) => {
           console.log(`[Job ${jobId}] Finished processing ${frameCount} frames → ${resultPath}`);
           
           const j = jobs.get(jobId);
@@ -199,7 +259,10 @@ async function startServer() {
 
           // Update meta with frame count + register in video registry
           updateJobMetaFrames(jobId, frameCount);
-          videoRegistry.set(`${filename}:${assembled.size}`, jobId);
+          videoRegistry.set(checkpointKey, jobId);
+
+          // Delete checkpoint — final result is now on disk
+          fs.promises.unlink(cpPath).catch(() => {});
 
           // Cleanup video file to save space
           if (fs.existsSync(finalPath)) {
@@ -382,10 +445,12 @@ async function startServer() {
 
     const rp = path.join(uploadDir, `${jobId}_result.json`);
     const mp = metaPath(jobId);
+    const cp = checkpointFilePath(jobId);
 
     let deleted = false;
     if (fs.existsSync(rp)) { try { fs.unlinkSync(rp); deleted = true; } catch { /* ignore */ } }
     if (fs.existsSync(mp)) { try { fs.unlinkSync(mp); } catch { /* ignore */ } }
+    if (fs.existsSync(cp)) { try { fs.unlinkSync(cp); } catch { /* ignore */ } }
 
     // Remove from in-memory stores
     const job = jobs.get(jobId);
