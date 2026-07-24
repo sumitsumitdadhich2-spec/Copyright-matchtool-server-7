@@ -133,6 +133,8 @@ async function startServer() {
   function loadJobFromDisk(jobId: string): Job | null {
     const rp = path.join(uploadDir, `${jobId}_result.json`);
     if (!fs.existsSync(rp)) return null;
+    // Checkpoint file present = job was interrupted; not yet complete
+    if (fs.existsSync(checkpointFilePath(jobId))) return null;
     // Read totalFrames from meta if available (fast); otherwise skip frame count
     let frameCount = 0;
     const mp = metaPath(jobId);
@@ -159,6 +161,10 @@ async function startServer() {
       const jobId = file.replace('_meta.json', '');
       const rp = path.join(uploadDir, `${jobId}_result.json`);
       if (!fs.existsSync(rp)) continue; // result missing → skip
+      // Checkpoint file present = job was interrupted; exclude from registry
+      // so the user is not served a partial result as if it were complete.
+      // findCheckpoint() will pick it up when the same file is re-uploaded.
+      if (fs.existsSync(checkpointFilePath(jobId))) continue;
       try {
         const meta: JobMeta = JSON.parse(
           fs.readFileSync(path.join(uploadDir, file), 'utf-8')

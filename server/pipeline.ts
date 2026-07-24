@@ -25,6 +25,33 @@ const currentDirname = getDirname();
 
 export const NUM_WORKERS = Math.max(1, Math.min(os.cpus().length, 128));
 
+/**
+ * Build a clean env for Nix-provided binaries (ffprobe, ffmpeg).
+ * When server.ts prepends /lib/x86_64-linux-gnu to LD_LIBRARY_PATH so that
+ * canvas.node can find libuuid.so.1, the system libmount.so.1 ends up before
+ * the Nix-provided one in the search order.  The system copy is older and
+ * lacks the MOUNT_2_40 versioned symbol that Nix glib requires, causing:
+ *   ffprobe: libmount.so.1: version `MOUNT_2_40' not found
+ * Fix: strip the system lib paths from LD_LIBRARY_PATH before spawning any
+ * Nix binary.  canvas workers inherit the unmodified process env and still
+ * find libuuid via the $ORIGIN symlink in node_modules/canvas/build/Release/.
+ */
+function makeCleanEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (env.LD_LIBRARY_PATH) {
+    const cleaned = env.LD_LIBRARY_PATH
+      .split(':')
+      .filter(p => p !== '/lib/x86_64-linux-gnu' && p !== '/usr/lib/x86_64-linux-gnu')
+      .join(':');
+    if (cleaned) {
+      env.LD_LIBRARY_PATH = cleaned;
+    } else {
+      delete env.LD_LIBRARY_PATH;
+    }
+  }
+  return env;
+}
+
 // ---------------------------------------------------------------------------
 // How often to attempt a flush (every N processed frames)
 // ---------------------------------------------------------------------------
@@ -258,7 +285,8 @@ export function extractFingerprints(
       let height = 0;
       try {
         const ffprobeOutput = execSync(
-          `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${videoPath}"`
+          `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${videoPath}"`,
+          { env: makeCleanEnv() }
         ).toString().trim();
         const [w, h] = ffprobeOutput.split('x').map(Number);
         if (!w || !h || isNaN(w) || isNaN(h)) {
@@ -290,7 +318,7 @@ export function extractFingerprints(
         '-pix_fmt', 'rgba',
         '-r', '25',
         '-'
-      ]);
+      ], { env: makeCleanEnv() });
 
       let buffer = Buffer.alloc(0);
       const frameSize = width * height * 4;

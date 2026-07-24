@@ -15,7 +15,7 @@ import path from 'path';
 
 const BASE      = 'http://localhost:5000';
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-const VIDEO      = 'real_video.mp4'; // ~80 KB sample already in repo
+const VIDEO      = 'checkpoint_test.mp4'; // 10s 320x240 25fps synthetic video (valid)
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
