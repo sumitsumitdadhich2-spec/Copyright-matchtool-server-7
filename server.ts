@@ -55,6 +55,84 @@ async function startServer() {
   }
   const jobs = new Map<string, Job>();
 
+  // Video identity registry: "filename:filesize" → jobId
+  // Lets the frontend skip re-upload when the same file is selected again.
+  interface JobMeta {
+    originalName: string;
+    fileSize: number;
+    createdAt: number;
+    totalFrames?: number;
+  }
+  const videoRegistry = new Map<string, string>();
+
+  function metaPath(jobId: string) {
+    return path.join(uploadDir, `${jobId}_meta.json`);
+  }
+
+  function writeJobMeta(jobId: string, meta: JobMeta) {
+    try {
+      fs.writeFileSync(metaPath(jobId), JSON.stringify(meta));
+    } catch (e) {
+      console.error(`[Meta] Failed to write meta for ${jobId}:`, e);
+    }
+  }
+
+  function updateJobMetaFrames(jobId: string, totalFrames: number) {
+    const mp = metaPath(jobId);
+    try {
+      if (fs.existsSync(mp)) {
+        const meta: JobMeta = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+        meta.totalFrames = totalFrames;
+        fs.writeFileSync(mp, JSON.stringify(meta));
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  /** Reconstruct a completed job from disk after a server restart */
+  function loadJobFromDisk(jobId: string): Job | null {
+    const rp = path.join(uploadDir, `${jobId}_result.json`);
+    if (!fs.existsSync(rp)) return null;
+    // Read totalFrames from meta if available (fast); otherwise skip frame count
+    let frameCount = 0;
+    const mp = metaPath(jobId);
+    if (fs.existsSync(mp)) {
+      try {
+        const meta: JobMeta = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+        frameCount = meta.totalFrames ?? 0;
+      } catch { /* ignore */ }
+    }
+    const job: Job = {
+      id: jobId, status: 'completed',
+      totalFrames: frameCount, processedFrames: frameCount,
+    };
+    jobs.set(jobId, job);
+    return job;
+  }
+
+  /** Scan uploads/ at startup to rebuild the video registry from persisted meta files */
+  async function rebuildJobsFromDisk() {
+    if (!fs.existsSync(uploadDir)) return;
+    let count = 0;
+    for (const file of fs.readdirSync(uploadDir)) {
+      if (!file.endsWith('_meta.json')) continue;
+      const jobId = file.replace('_meta.json', '');
+      const rp = path.join(uploadDir, `${jobId}_result.json`);
+      if (!fs.existsSync(rp)) continue; // result missing → skip
+      try {
+        const meta: JobMeta = JSON.parse(
+          fs.readFileSync(path.join(uploadDir, file), 'utf-8')
+        );
+        if (meta.originalName && meta.fileSize) {
+          videoRegistry.set(`${meta.originalName}:${meta.fileSize}`, jobId);
+          count++;
+        }
+      } catch { /* corrupt meta — skip */ }
+    }
+    if (count > 0) console.log(`[Startup] Rebuilt video registry: ${count} cached job(s)`);
+  }
+
+  await rebuildJobsFromDisk();
+
   // --- API ROUTES ---
 
   // 1. Health check
@@ -88,6 +166,14 @@ async function startServer() {
         };
         jobs.set(jobId, job);
 
+        // Persist meta so we can recover after server restart
+        const assembled = await fs.promises.stat(finalPath).catch(() => ({ size: 0 }));
+        writeJobMeta(jobId, {
+          originalName: filename,
+          fileSize: assembled.size,
+          createdAt: Date.now(),
+        });
+
         res.json({ jobId });
 
         // Kick off processing in the background
@@ -110,7 +196,11 @@ async function startServer() {
             j.processedFrames = frameCount;
             j.totalFrames = frameCount;
           }
-          
+
+          // Update meta with frame count + register in video registry
+          updateJobMetaFrames(jobId, frameCount);
+          videoRegistry.set(`${filename}:${assembled.size}`, jobId);
+
           // Cleanup video file to save space
           if (fs.existsSync(finalPath)) {
             fs.unlinkSync(finalPath);
@@ -201,10 +291,10 @@ async function startServer() {
     });
   });
 
-  // 4. Status endpoint
+  // 4. Status endpoint — falls back to disk after a server restart
   app.get('/api/status/:jobId', (req, res) => {
     const { jobId } = req.params;
-    const job = jobs.get(jobId);
+    const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
     }
@@ -216,7 +306,7 @@ async function startServer() {
   // (new files are NDJSON; old files are a JSON array).
   app.get('/api/result/:jobId', (req, res) => {
     const { jobId } = req.params;
-    const job = jobs.get(jobId);
+    const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
     }
@@ -258,6 +348,56 @@ async function startServer() {
       console.error(`Failed to read result file for job ${jobId}:`, err);
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // 6a. Video identity lookup — returns cached jobId if we've already processed this exact file
+  app.get('/api/lookup-video', (req, res) => {
+    const name = req.query.name as string;
+    const size = parseInt(req.query.size as string, 10);
+    if (!name || isNaN(size)) {
+      return res.status(400).json({ error: 'name and size are required' });
+    }
+    const jobId = videoRegistry.get(`${name}:${size}`);
+    if (!jobId) return res.status(404).json({ error: 'Not found' });
+
+    // Verify result file still exists (user may have manually cleaned uploads/)
+    const rp = path.join(uploadDir, `${jobId}_result.json`);
+    if (!fs.existsSync(rp)) {
+      videoRegistry.delete(`${name}:${size}`);
+      return res.status(404).json({ error: 'Result file missing' });
+    }
+
+    const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
+    if (!job || job.status !== 'completed') {
+      return res.status(404).json({ error: 'Job not completed' });
+    }
+    res.json({ jobId, totalFrames: job.totalFrames });
+  });
+
+  // 6b. Delete a job — removes result + meta files and clears registry entry
+  app.delete('/api/job/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    // Basic validation: only alphanumeric + dash
+    if (!/^[\w-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid jobId' });
+
+    const rp = path.join(uploadDir, `${jobId}_result.json`);
+    const mp = metaPath(jobId);
+
+    let deleted = false;
+    if (fs.existsSync(rp)) { try { fs.unlinkSync(rp); deleted = true; } catch { /* ignore */ } }
+    if (fs.existsSync(mp)) { try { fs.unlinkSync(mp); } catch { /* ignore */ } }
+
+    // Remove from in-memory stores
+    const job = jobs.get(jobId);
+    jobs.delete(jobId);
+
+    // Remove from video registry (search by value)
+    for (const [k, v] of videoRegistry) {
+      if (v === jobId) { videoRegistry.delete(k); break; }
+    }
+
+    console.log(`[Delete] Job ${jobId} removed (file existed: ${deleted})`);
+    res.json({ deleted });
   });
 
   // 6. Match endpoint — runs groundMatchedSegments on two stored result JSONs

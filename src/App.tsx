@@ -3,10 +3,12 @@ import {
   CloudUpload, Video, Server, Monitor, Play, Pause, Download, Search,
   Film, ScanLine, Activity, X, AlertCircle, CheckCircle2, Layers,
   Sliders, RotateCcw, RefreshCw, ChevronDown, ChevronUp, Repeat,
-  ShieldCheck, Cpu, Zap
+  ShieldCheck, Cpu, Zap, Trash2, Database
 } from 'lucide-react';
 import { processVideoFile, processVideoOnServer } from './VideoProcessor';
 import { clearVideoFingerprints } from './utils/db';
+import { saveJobSession, getJobSession, clearJobSession } from './utils/session';
+import type { CachedJob } from './utils/session';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -181,7 +183,8 @@ export default function App() {
   const [refJobId, setRefJobId]     = useState<string>('');
   const [refProgress, setRefProgress] = useState({ processed: 0, total: 0, startTime: 0 });
   const [refDone, setRefDone]       = useState(false);
-  const [refBatches, setRefBatches] = useState(0);
+  const [refBatches, setRefBatches]       = useState(0);
+  const [targetBatches, setTargetBatches] = useState(0);
 
   // Target clip state
   const [targetFile, setTargetFile]       = useState<File | null>(null);
@@ -215,6 +218,12 @@ export default function App() {
   const [isProcessingRef, setIsProcessingRef]       = useState(false);
   const [isProcessingTarget, setIsProcessingTarget] = useState(false);
 
+  // Cache / session state
+  const [refCached, setRefCached]           = useState(false);
+  const [targetCached, setTargetCached]     = useState(false);
+  const [refCachedMeta, setRefCachedMeta]   = useState<{ fileName: string; totalFrames: number } | null>(null);
+  const [targetCachedMeta, setTargetCachedMeta] = useState<{ fileName: string; totalFrames: number } | null>(null);
+
   // Preview panel
   const [previewSegment, setPreviewSegment] = useState<MatchedSegment | null>(null);
   const [isPlaying, setIsPlaying]           = useState(false);
@@ -244,6 +253,104 @@ export default function App() {
     };
   }, []);
 
+  // Restore previous sessions on page load so the user doesn't have to re-upload
+  useEffect(() => {
+    restoreSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function restoreSessions() {
+    for (const role of ['reference', 'target'] as const) {
+      const session = getJobSession(role);
+      if (!session) continue;
+      try {
+        const res = await fetch(`/api/status/${session.jobId}`);
+        if (!res.ok) { clearJobSession(role); continue; }
+        const job = await res.json();
+        if (job.status === 'completed') {
+          applyRestoredSession(role, session, job.totalFrames || session.totalFrames);
+        } else if (job.status === 'processing' || job.status === 'pending') {
+          // Job still running on server — reconnect and poll
+          if (role === 'reference') {
+            setRefJobId(session.jobId);
+            setIsProcessingRef(true);
+            setStatus('Reconnecting to reference processing…');
+          } else {
+            setTargetJobId(session.jobId);
+            setIsProcessingTarget(true);
+            setStatus('Reconnecting to target processing…');
+          }
+          pollUntilDone(session.jobId, role, session);
+        } else {
+          clearJobSession(role);
+        }
+      } catch {
+        clearJobSession(role);
+      }
+    }
+  }
+
+  function applyRestoredSession(
+    role: 'reference' | 'target',
+    session: CachedJob,
+    totalFrames: number
+  ) {
+    if (role === 'reference') {
+      setRefJobId(session.jobId);
+      setRefDone(true);
+      setRefCached(true);
+      setRefCachedMeta({ fileName: session.fileName, totalFrames });
+    } else {
+      setTargetJobId(session.jobId);
+      setTargetDone(true);
+      setTargetCached(true);
+      setTargetCachedMeta({ fileName: session.fileName, totalFrames });
+    }
+  }
+
+  async function pollUntilDone(
+    jobId: string,
+    role: 'reference' | 'target',
+    session: CachedJob
+  ) {
+    while (true) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const res = await fetch(`/api/status/${jobId}`);
+        if (!res.ok) {
+          clearJobSession(role);
+          if (role === 'reference') { setIsProcessingRef(false); setRefJobId(''); }
+          else { setIsProcessingTarget(false); setTargetJobId(''); }
+          break;
+        }
+        const job = await res.json();
+        if (role === 'reference') setRefProgress({ processed: job.processedFrames, total: job.totalFrames, startTime: 0 });
+        else setTargetProgress({ processed: job.processedFrames, total: job.totalFrames, startTime: 0 });
+
+        if (job.status === 'completed') {
+          const updated: CachedJob = { ...session, totalFrames: job.totalFrames };
+          saveJobSession(role, updated);
+          if (role === 'reference') {
+            setIsProcessingRef(false);
+            setStatus(`Reference ready: ${job.totalFrames} frames.`);
+          } else {
+            setIsProcessingTarget(false);
+            setStatus(`Target ready: ${job.totalFrames} frames.`);
+          }
+          applyRestoredSession(role, updated, job.totalFrames);
+          break;
+        } else if (job.status === 'failed') {
+          clearJobSession(role);
+          if (role === 'reference') { setIsProcessingRef(false); setErrorMsg(`Reference failed: ${job.error}`); }
+          else { setIsProcessingTarget(false); setErrorMsg(`Target failed: ${job.error}`); }
+          break;
+        }
+      } catch {
+        break;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Loop / segment-end detection
   // ---------------------------------------------------------------------------
@@ -264,30 +371,68 @@ export default function App() {
   }, []);
 
   // ---------------------------------------------------------------------------
-  // File handlers
+  // File handlers — also check for cached fingerprints on selection
   // ---------------------------------------------------------------------------
-  const handleRefFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleRefFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     setRefFile(file);
     setRefDone(false);
     setRefJobId('');
+    setRefCached(false);
+    setRefCachedMeta(null);
     setSegments([]);
     setMatchStats(null);
     setPreviewSegment(null);
+    setStatus('');
     if (refFileUrl) URL.revokeObjectURL(refFileUrl);
     setRefFileUrl(file ? URL.createObjectURL(file) : '');
+
+    if (file && processMode === 'server') {
+      try {
+        const res = await fetch(
+          `/api/lookup-video?name=${encodeURIComponent(file.name)}&size=${file.size}`
+        );
+        if (res.ok) {
+          const { jobId, totalFrames } = await res.json();
+          setRefJobId(jobId);
+          setRefDone(true);
+          setRefCached(true);
+          setRefCachedMeta({ fileName: file.name, totalFrames });
+          saveJobSession('reference', { jobId, fileName: file.name, fileSize: file.size, totalFrames, savedAt: Date.now() });
+          setStatus(`Saved fingerprints found for reference (${totalFrames} frames) — extraction skipped.`);
+        }
+      } catch { /* lookup failure is non-fatal */ }
+    }
   };
 
-  const handleTargetFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleTargetFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     setTargetFile(file);
     setTargetDone(false);
     setTargetJobId('');
+    setTargetCached(false);
+    setTargetCachedMeta(null);
     setSegments([]);
     setMatchStats(null);
     setPreviewSegment(null);
     if (targetFileUrl) URL.revokeObjectURL(targetFileUrl);
     setTargetFileUrl(file ? URL.createObjectURL(file) : '');
+
+    if (file && processMode === 'server') {
+      try {
+        const res = await fetch(
+          `/api/lookup-video?name=${encodeURIComponent(file.name)}&size=${file.size}`
+        );
+        if (res.ok) {
+          const { jobId, totalFrames } = await res.json();
+          setTargetJobId(jobId);
+          setTargetDone(true);
+          setTargetCached(true);
+          setTargetCachedMeta({ fileName: file.name, totalFrames });
+          saveJobSession('target', { jobId, fileName: file.name, fileSize: file.size, totalFrames, savedAt: Date.now() });
+        }
+      } catch { /* non-fatal */ }
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -295,9 +440,18 @@ export default function App() {
   // ---------------------------------------------------------------------------
   const handleProcessReference = async () => {
     if (!refFile) return;
+
+    // If fingerprints are already cached for this exact file, skip re-extraction
+    if (refCached && refJobId) {
+      setStatus(`Using saved fingerprints for reference (${refCachedMeta?.totalFrames ?? '?'} frames). Ready to match.`);
+      return;
+    }
+
     setIsProcessingRef(true);
     setRefDone(false);
     setRefJobId('');
+    setRefCached(false);
+    setRefCachedMeta(null);
     setErrorMsg('');
     setStatus(`Processing reference video${processMode === 'server' ? ' on server' : ' in browser'}…`);
 
@@ -314,6 +468,13 @@ export default function App() {
       setRefJobId(jobId || '');
       setRefDone(true);
       setStatus(`Reference processed: ${totalFrames} frames.`);
+
+      if (jobId && processMode === 'server') {
+        const session = { jobId, fileName: refFile.name, fileSize: refFile.size, totalFrames, savedAt: Date.now() };
+        saveJobSession('reference', session);
+        setRefCached(true);
+        setRefCachedMeta({ fileName: refFile.name, totalFrames });
+      }
     } catch (e: any) {
       setErrorMsg(`Reference error: ${e.message}`);
       setStatus('');
@@ -326,50 +487,79 @@ export default function App() {
   // Process target + match
   // ---------------------------------------------------------------------------
   const handleRunAnalysis = async () => {
-    if (!targetFile) return;
-    setIsProcessingTarget(true);
+    if (!targetFile && !targetCached) return;
     setIsMatching(false);
     setSegments([]);
     setUnmatched([]);
     setMatchStats(null);
     setPreviewSegment(null);
     setErrorMsg('');
-    setStatus(`Processing target clip${processMode === 'server' ? ' on server' : ' in browser'}…`);
 
-    try {
-      await clearVideoFingerprints('target');
-      const startTime = performance.now();
-      const run = processMode === 'server' ? processVideoOnServer : processVideoFile;
+    let finalTargetJobId = targetJobId;
+    let finalTotalFrames = targetCachedMeta?.totalFrames ?? 0;
 
-      const { totalFrames, batches, jobId } = await run(targetFile, 'target', (p, t) => {
-        setTargetProgress({ processed: p, total: t, startTime });
-      });
+    // If target fingerprints already cached, skip extraction
+    if (targetCached && targetJobId) {
+      setStatus('Using saved target fingerprints. Running segment matching…');
+    } else if (targetFile) {
+      setIsProcessingTarget(true);
+      setStatus(`Processing target clip${processMode === 'server' ? ' on server' : ' in browser'}…`);
 
-      setTargetJobId(jobId || '');
-      setTargetDone(true);
-      setIsProcessingTarget(false);
+      try {
+        await clearVideoFingerprints('target');
+        const startTime = performance.now();
+        const run = processMode === 'server' ? processVideoOnServer : processVideoFile;
 
-      if (processMode === 'server') {
-        if (!refJobId) {
-          setErrorMsg('Reference job ID not found — please re-process the reference video first.');
-          return;
+        const { totalFrames, batches, jobId } = await run(targetFile, 'target', (p, t) => {
+          setTargetProgress({ processed: p, total: t, startTime });
+        });
+
+        finalTargetJobId = jobId || '';
+        finalTotalFrames = totalFrames;
+        setTargetBatches(batches);
+        setTargetJobId(finalTargetJobId);
+        setTargetDone(true);
+        setIsProcessingTarget(false);
+
+        if (jobId && processMode === 'server') {
+          const session = { jobId, fileName: targetFile.name, fileSize: targetFile.size, totalFrames, savedAt: Date.now() };
+          saveJobSession('target', session);
+          setTargetCached(true);
+          setTargetCachedMeta({ fileName: targetFile.name, totalFrames });
         }
-        if (!jobId) {
-          setErrorMsg('Target job ID missing — re-process the target clip.');
-          return;
-        }
-        setIsMatching(true);
-        setStatus(`Fingerprints extracted (${totalFrames} frames). Running segment matching…`);
+      } catch (e: any) {
+        setErrorMsg(`Error: ${e.message}`);
+        setStatus('');
+        setIsProcessingTarget(false);
+        return;
+      }
+    } else {
+      return;
+    }
 
-        // Convert minSegmentDuration (seconds) to min consecutive frames @ 25fps
-        const minConsecutiveFrames = Math.max(5, Math.round(minSegmentDuration * 25));
+    // --- matching (server mode) ---
+    if (processMode === 'server') {
+      if (!refJobId) {
+        setErrorMsg('Reference job ID not found — please process the reference video first.');
+        return;
+      }
+      if (!finalTargetJobId) {
+        setErrorMsg('Target job ID missing — re-process the target clip.');
+        return;
+      }
+      setIsMatching(true);
+      setStatus(`Fingerprints ready (${finalTotalFrames} frames). Running segment matching…`);
 
+      // Convert minSegmentDuration (seconds) to min consecutive frames @ 25fps
+      const minConsecutiveFrames = Math.max(5, Math.round(minSegmentDuration * 25));
+
+      try {
         const matchRes = await fetch('/api/match', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             movieJobId: refJobId,
-            shortJobId: jobId,
+            shortJobId: finalTargetJobId,
             minSimilarity: similarityThreshold,
             minConsecutiveFrames,
             frameDrift
@@ -389,39 +579,67 @@ export default function App() {
         const segs = data.segments || [];
         const unmatched = data.unmatchedRanges || [];
         setStatus(`Matching complete. ${segs.length} segment(s) found${unmatched.length > 0 ? `, ${unmatched.length} unmatched range(s)` : ' — full clip covered'}.`);
-      } else {
-        setIsMatching(true);
-        setStatus('Running browser-side matching…');
-
-        const { loadAllReferenceFingerprints, compareFingerprints } = await import('./Matcher');
-        const refFps    = await loadAllReferenceFingerprints('reference', refBatches);
-        const targetFps = await loadAllReferenceFingerprints('target', batches);
-
-        let bestSim = 0, bestMi = 0;
-        for (let mi = 0; mi < refFps.length; mi += 5) {
-          const sim = compareFingerprints(targetFps[0], refFps[mi]);
-          if (sim > bestSim) { bestSim = sim; bestMi = mi; }
-        }
-
-        // Browser mode: rough best-frame match only — no walk, so speed ratio
-        // is unknown. movieEnd is estimated assuming normal speed (1:1 frames).
-        setSegments([{
-          shortStart: targetFps[0]?.timestamp ?? 0,
-          shortEnd:   targetFps[targetFps.length - 1]?.timestamp ?? 0,
-          movieStart: refFps[bestMi]?.timestamp ?? 0,
-          movieEnd:   refFps[Math.min(refFps.length - 1, bestMi + targetFps.length)]?.timestamp ?? 0,
-          confidence: bestSim, frameCount: targetFps.length,
-          isApproximate: true, speedRatio: 1, matchSequence: []
-        }]);
+      } catch (e: any) {
+        setErrorMsg(`Error: ${e.message}`);
+        setStatus('');
         setIsMatching(false);
-        setStatus('Browser matching complete.');
       }
+      return;
+    }
+
+    // --- matching (browser mode) ---
+    setIsMatching(true);
+    setStatus('Running browser-side matching…');
+    try {
+      const { loadAllReferenceFingerprints, compareFingerprints } = await import('./Matcher');
+      const refFps    = await loadAllReferenceFingerprints('reference', refBatches);
+      const targetFps = await loadAllReferenceFingerprints('target', targetBatches);
+
+      let bestSim = 0, bestMi = 0;
+      for (let mi = 0; mi < refFps.length; mi += 5) {
+        const sim = compareFingerprints(targetFps[0], refFps[mi]);
+        if (sim > bestSim) { bestSim = sim; bestMi = mi; }
+      }
+
+      // Browser mode: rough best-frame match only — speed ratio unknown.
+      setSegments([{
+        shortStart: targetFps[0]?.timestamp ?? 0,
+        shortEnd:   targetFps[targetFps.length - 1]?.timestamp ?? 0,
+        movieStart: refFps[bestMi]?.timestamp ?? 0,
+        movieEnd:   refFps[Math.min(refFps.length - 1, bestMi + targetFps.length)]?.timestamp ?? 0,
+        confidence: bestSim, frameCount: targetFps.length,
+        isApproximate: true, speedRatio: 1, matchSequence: []
+      }]);
+      setIsMatching(false);
+      setStatus('Browser matching complete.');
     } catch (e: any) {
       setErrorMsg(`Error: ${e.message}`);
       setStatus('');
-      setIsProcessingTarget(false);
       setIsMatching(false);
     }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Delete cached fingerprints
+  // ---------------------------------------------------------------------------
+  const handleDeleteRef = async () => {
+    if (refJobId) {
+      try { await fetch(`/api/job/${refJobId}`, { method: 'DELETE' }); } catch { /* ignore */ }
+    }
+    clearJobSession('reference');
+    setRefJobId(''); setRefDone(false); setRefCached(false); setRefCachedMeta(null);
+    setSegments([]); setMatchStats(null); setPreviewSegment(null);
+    setStatus('Reference fingerprints deleted.');
+  };
+
+  const handleDeleteTarget = async () => {
+    if (targetJobId) {
+      try { await fetch(`/api/job/${targetJobId}`, { method: 'DELETE' }); } catch { /* ignore */ }
+    }
+    clearJobSession('target');
+    setTargetJobId(''); setTargetDone(false); setTargetCached(false); setTargetCachedMeta(null);
+    setSegments([]); setMatchStats(null); setPreviewSegment(null);
+    setStatus('Target fingerprints deleted.');
   };
 
   // ---------------------------------------------------------------------------
@@ -528,7 +746,7 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // Derived
   // ---------------------------------------------------------------------------
-  const canRunAnalysis = !!targetFile && refDone && !isProcessingRef && !isProcessingTarget && !isMatching;
+  const canRunAnalysis = (!!targetFile || (targetCached && !!targetJobId)) && refDone && !isProcessingRef && !isProcessingTarget && !isMatching;
   const busy = isProcessingRef || isProcessingTarget || isMatching;
 
   // ---------------------------------------------------------------------------
@@ -570,6 +788,43 @@ export default function App() {
           </div>
         )}
 
+        {/* ── Saved Sessions panel ── */}
+        {(refCached || targetCached) && (
+          <section className="bg-slate-900/60 border border-slate-700/60 rounded-2xl p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Database className="w-4 h-4 text-teal-400" />
+              <h3 className="text-sm font-semibold text-slate-300">Saved Fingerprints</h3>
+              <span className="text-xs text-slate-600 font-mono ml-1">— persists until deleted</span>
+            </div>
+            <div className="space-y-2">
+              {refCached && refCachedMeta && (
+                <div className="flex items-center justify-between gap-3 bg-slate-800/50 rounded-xl px-3 py-2.5">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-slate-300 truncate">{refCachedMeta.fileName}</p>
+                    <p className="text-[10px] text-slate-500 font-mono">{refCachedMeta.totalFrames.toLocaleString()} frames · Reference</p>
+                  </div>
+                  <button onClick={handleDeleteRef} disabled={busy}
+                    className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg border border-red-500/20 transition disabled:opacity-40 cursor-pointer">
+                    <Trash2 className="w-3 h-3" /> Delete
+                  </button>
+                </div>
+              )}
+              {targetCached && targetCachedMeta && (
+                <div className="flex items-center justify-between gap-3 bg-slate-800/50 rounded-xl px-3 py-2.5">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-slate-300 truncate">{targetCachedMeta.fileName}</p>
+                    <p className="text-[10px] text-slate-500 font-mono">{targetCachedMeta.totalFrames.toLocaleString()} frames · Target</p>
+                  </div>
+                  <button onClick={handleDeleteTarget} disabled={busy}
+                    className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg border border-red-500/20 transition disabled:opacity-40 cursor-pointer">
+                    <Trash2 className="w-3 h-3" /> Delete
+                  </button>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
         {/* ── Step 1: Reference ── */}
         <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
           <div className="flex items-center gap-3">
@@ -580,12 +835,30 @@ export default function App() {
               <h2 className="text-base font-semibold text-white">Step 1 — Reference Movie</h2>
               <p className="text-xs text-slate-500">The full-length video to search within</p>
             </div>
-            {refDone && (
-              <span className="ml-auto flex items-center gap-1 text-xs text-green-400 font-medium">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Ready
-              </span>
-            )}
+            <div className="ml-auto flex items-center gap-2">
+              {refDone && refCached && (
+                <span className="flex items-center gap-1 text-xs text-teal-400 font-medium">
+                  <Database className="w-3 h-3" /> Cached
+                </span>
+              )}
+              {refDone && !refCached && (
+                <span className="flex items-center gap-1 text-xs text-green-400 font-medium">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> Ready
+                </span>
+              )}
+            </div>
           </div>
+
+          {/* Show cached-file banner when session was restored without a file */}
+          {refCached && !refFile && refCachedMeta && (
+            <div className="flex items-center gap-3 bg-teal-950/30 border border-teal-700/30 rounded-xl px-4 py-3">
+              <Database className="w-4 h-4 text-teal-400 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-medium text-teal-300 truncate">{refCachedMeta.fileName}</p>
+                <p className="text-[10px] text-teal-600 font-mono">{refCachedMeta.totalFrames.toLocaleString()} frames saved · select the file below only if you want to preview video</p>
+              </div>
+            </div>
+          )}
 
           <div className="relative group">
             <input type="file" accept="video/mp4" onChange={handleRefFileChange}
@@ -593,15 +866,21 @@ export default function App() {
             <div className={`flex items-center gap-3 p-4 border-2 border-dashed rounded-xl transition-colors ${refFile ? 'border-blue-500/40 bg-blue-500/5' : 'border-slate-700 bg-slate-800/40 group-hover:border-slate-600'}`}>
               <CloudUpload className={`w-5 h-5 shrink-0 ${refFile ? 'text-blue-400' : 'text-slate-500'}`} />
               <div className="min-w-0">
-                <p className="text-sm font-medium text-slate-300 truncate">{refFile ? refFile.name : 'Drop reference video here or click to browse'}</p>
+                <p className="text-sm font-medium text-slate-300 truncate">
+                  {refFile ? refFile.name : (refCached ? 'Select file to re-extract (optional — cached fingerprints are ready)' : 'Drop reference video here or click to browse')}
+                </p>
                 {refFile && <p className="text-xs text-slate-500">{(refFile.size / 1024 / 1024).toFixed(1)} MB</p>}
               </div>
             </div>
           </div>
 
-          <button onClick={handleProcessReference} disabled={!refFile || isProcessingRef}
+          <button onClick={handleProcessReference} disabled={(!refFile && !refCached) || isProcessingRef}
             className="w-full flex justify-center items-center gap-2 py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-colors cursor-pointer">
-            {isProcessingRef ? <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</> : <><Activity className="w-4 h-4" /> Extract Fingerprints</>}
+            {isProcessingRef
+              ? <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</>
+              : refCached && refJobId
+              ? <><CheckCircle2 className="w-4 h-4" /> Using Saved Fingerprints</>
+              : <><Activity className="w-4 h-4" /> Extract Fingerprints</>}
           </button>
           {renderProgress(refProgress, 'bg-blue-500')}
         </section>
@@ -741,12 +1020,30 @@ export default function App() {
               <h2 className="text-base font-semibold text-white">Step 2 — Target Clip &amp; Find Matches</h2>
               <p className="text-xs text-slate-500">Upload the clip to locate inside the reference</p>
             </div>
-            {targetDone && (
-              <span className="ml-auto flex items-center gap-1 text-xs text-green-400 font-medium">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Processed
-              </span>
-            )}
+            <div className="ml-auto flex items-center gap-2">
+              {targetDone && targetCached && (
+                <span className="flex items-center gap-1 text-xs text-teal-400 font-medium">
+                  <Database className="w-3 h-3" /> Cached
+                </span>
+              )}
+              {targetDone && !targetCached && (
+                <span className="flex items-center gap-1 text-xs text-green-400 font-medium">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> Processed
+                </span>
+              )}
+            </div>
           </div>
+
+          {/* Cached-file banner when session restored without a file */}
+          {targetCached && !targetFile && targetCachedMeta && (
+            <div className="flex items-center gap-3 bg-teal-950/30 border border-teal-700/30 rounded-xl px-4 py-3">
+              <Database className="w-4 h-4 text-teal-400 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-medium text-teal-300 truncate">{targetCachedMeta.fileName}</p>
+                <p className="text-[10px] text-teal-600 font-mono">{targetCachedMeta.totalFrames.toLocaleString()} frames saved · ready to match</p>
+              </div>
+            </div>
+          )}
 
           <div className="relative group">
             <input type="file" accept="video/mp4" onChange={handleTargetFileChange}
@@ -754,13 +1051,15 @@ export default function App() {
             <div className={`flex items-center gap-3 p-4 border-2 border-dashed rounded-xl transition-colors ${targetFile ? 'border-indigo-500/40 bg-indigo-500/5' : 'border-slate-700 bg-slate-800/40 group-hover:border-slate-600'}`}>
               <CloudUpload className={`w-5 h-5 shrink-0 ${targetFile ? 'text-indigo-400' : 'text-slate-500'}`} />
               <div className="min-w-0">
-                <p className="text-sm font-medium text-slate-300 truncate">{targetFile ? targetFile.name : 'Drop target clip here or click to browse'}</p>
+                <p className="text-sm font-medium text-slate-300 truncate">
+                  {targetFile ? targetFile.name : (targetCached ? 'Select file to re-extract (optional — cached fingerprints are ready)' : 'Drop target clip here or click to browse')}
+                </p>
                 {targetFile && <p className="text-xs text-slate-500">{(targetFile.size / 1024 / 1024).toFixed(1)} MB</p>}
               </div>
             </div>
           </div>
 
-          {!refDone && targetFile && (
+          {!refDone && (targetFile || targetCached) && (
             <p className="text-xs text-amber-400/80 flex items-center gap-1.5">
               <AlertCircle className="w-3.5 h-3.5" /> Process the reference video first (Step 1).
             </p>
