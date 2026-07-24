@@ -74,6 +74,13 @@ export function extractFingerprints(
     // Track the highest frame index already written to disk.
     let lastFlushedFrame = 0;
 
+    // Set after ffprobe; controls how many raw-pixel frames we allow in the
+    // task queue at once.  At 1 080p a frame is ~8 MB; at 4K it is ~33 MB.
+    // Hardcoding 100 was safe for 1 080p (800 MB queue) but blew past 8 GB for
+    // 4K content (100 × 33 MB = 3.3 GB before any fingerprints are computed).
+    let frameBytes       = 0;
+    let dynamicQueueLimit = 100; // default until ffprobe fills this in
+
     // ── Write stream ─────────────────────────────────────────────────────────
     let writeStreamErr: Error | null = null;
     const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf8' });
@@ -136,7 +143,14 @@ export function extractFingerprints(
           height: task.height
         });
       }
-      if (taskQueue.length < 50 && ffmpegProcess && ffmpegProcess.stdout.isPaused()) {
+      // Resume only when the queue has drained to half the limit AND RSS is
+      // comfortably below the flush threshold (prevents yo-yo pausing).
+      const resumeAt = Math.max(2, Math.floor(dynamicQueueLimit / 2));
+      if (
+        taskQueue.length < resumeAt &&
+        process.memoryUsage().rss < RAM_FLUSH_THRESHOLD_BYTES * 0.85 &&
+        ffmpegProcess?.stdout.isPaused()
+      ) {
         ffmpegProcess.stdout.resume();
       }
     }
@@ -205,7 +219,18 @@ export function extractFingerprints(
         throw new Error(`Could not determine video dimensions: ${err.message}`);
       }
 
-      console.log(`Pipeline starting for ${videoPath} (${width}x${height})`);
+      // ── Dynamic queue limit ──────────────────────────────────────────────
+      // Cap raw-frame RAM in the task queue at ~1.5 GB regardless of resolution.
+      //   1 080p  (8.3 MB/frame) → ~180 frames in queue  (~1.5 GB)
+      //   4K      (33  MB/frame) →  ~45 frames in queue  (~1.5 GB)
+      frameBytes        = width * height * 4;
+      const QUEUE_RAM_CAP = 1.5 * 1024 * 1024 * 1024;
+      dynamicQueueLimit = Math.max(4, Math.min(500, Math.floor(QUEUE_RAM_CAP / frameBytes)));
+      console.log(
+        `Pipeline starting for ${videoPath} (${width}x${height})` +
+        ` — frame ${(frameBytes / 1_048_576).toFixed(1)} MB` +
+        ` — queue limit ${dynamicQueueLimit} frames (~${(dynamicQueueLimit * frameBytes / 1_073_741_824).toFixed(2)} GB)`
+      );
 
       ffmpegProcess = spawn('ffmpeg', [
         '-i', videoPath,
@@ -251,7 +276,14 @@ export function extractFingerprints(
             frameIndex: currentFrame
           });
 
-          if (taskQueue.length >= 100 && !ffmpegProcess.stdout.isPaused()) {
+          // Pause ffmpeg when the queue is full OR when total RSS is high.
+          // Both conditions are checked so a very large video resolution
+          // triggers pause even before the frame count limit is reached.
+          const rssNow = process.memoryUsage().rss;
+          if (
+            (taskQueue.length >= dynamicQueueLimit || rssNow >= RAM_FLUSH_THRESHOLD_BYTES) &&
+            !ffmpegProcess.stdout.isPaused()
+          ) {
             ffmpegProcess.stdout.pause();
           }
 

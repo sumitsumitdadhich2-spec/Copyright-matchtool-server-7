@@ -12,6 +12,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as readline from 'readline';
 import { FrameSignature, VariantHashes } from '../src/shared/fingerprint';
 
@@ -1534,11 +1535,449 @@ export async function streamPrecomputeFromFile(filePath: string): Promise<PreSet
   return streamPrecomputeFromNDJSON(filePath);
 }
 
+// ---------------------------------------------------------------------------
+// Chunked movie matching — loads movie data in fixed-size windows so that
+// RAM consumption is bounded regardless of movie length.
+//
+// Activated automatically by matchVideosFromFiles when the estimated movie
+// PreSet would exceed 4 GB or when free system RAM is tight.
+// ---------------------------------------------------------------------------
+
+/** Variant-level metadata extracted from the first line of an NDJSON file. */
+interface VariantMeta {
+  variantNames: string[];
+  numVariants:  number;
+  aBits:  number; aWords: number;
+  dBits:  number; dWords: number;
+  hasFlip: boolean;
+  hasD:    boolean;
+}
+
+/**
+ * Single pass through the movie NDJSON to build a byte-offset index for each
+ * line (frame).  Returns the index and variant metadata from the first frame.
+ * Time: O(file size); RAM: O(frameCount × 8 bytes) — ~1.4 MB per 180 K frames.
+ */
+async function buildMovieLineIndex(filePath: string): Promise<{
+  byteOffsets: Float64Array;   // byteOffsets[i] = byte start of NDJSON line i
+  totalFrames: number;
+  meta: VariantMeta;
+}> {
+  const offsets: number[] = [];
+  let meta: VariantMeta | null = null;
+  let bytePos  = 0;
+  let lineStart = 0;
+  let partial   = '';                // carries incomplete line across chunks
+
+  await new Promise<void>((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+    stream.on('data', (raw: Buffer | string) => {
+      const chunk: Buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as string, 'binary');
+      let chunkOff = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] === 10 /* '\n' */) {
+          const lineText = partial + chunk.subarray(chunkOff, i).toString('utf8');
+          partial   = '';
+          chunkOff  = i + 1;
+          if (lineText.trim()) {
+            offsets.push(lineStart);
+            if (!meta) {
+              try {
+                const frame = JSON.parse(lineText);
+                const vn    = Object.keys(frame.variants || {});
+                const fv    = frame.variants?.[vn[0]];
+                const aBits = fv?.hash?.length  || 256;
+                const dBits = typeof fv?.dhash === 'string' ? fv.dhash.length : 0;
+                meta = {
+                  variantNames: vn, numVariants: vn.length,
+                  aBits, aWords: Math.max(1, Math.ceil(aBits / 32)),
+                  dBits, dWords: dBits > 0 ? Math.max(1, Math.ceil(dBits / 32)) : 0,
+                  hasFlip: typeof fv?.fhash === 'string' && fv.fhash.length > 0,
+                  hasD:    dBits > 0,
+                };
+              } catch { /* keep meta null, retry next line */ }
+            }
+          }
+          lineStart = bytePos + i + 1;
+        }
+      }
+      partial  += chunk.subarray(chunkOff).toString('utf8');
+      bytePos  += chunk.length;
+    });
+    stream.on('end', () => {
+      if (partial.trim()) offsets.push(lineStart);
+      resolve();
+    });
+    stream.on('error', reject);
+  });
+
+  const defaultMeta: VariantMeta = {
+    variantNames: [], numVariants: 0, aBits: 256, aWords: 8,
+    dBits: 0, dWords: 0, hasFlip: false, hasD: false,
+  };
+  return {
+    byteOffsets: new Float64Array(offsets),
+    totalFrames: offsets.length,
+    meta:        meta ?? defaultMeta,
+  };
+}
+
+/**
+ * Load a contiguous range of movie frames [globalStart, globalEnd] from an
+ * NDJSON file using pre-built byte offsets, and return a PreSet whose frame
+ * indices run 0 .. (globalEnd − globalStart).
+ *
+ * The returned PreSet has correct timestamps from the file; the caller must
+ * add `globalStart` to any `mi` values before using them with a global fps array.
+ */
+async function loadMovieWindowPreset(
+  filePath:     string,
+  byteOffsets:  Float64Array,
+  globalStart:  number,
+  globalEnd:    number,
+  meta:         VariantMeta,
+): Promise<PreSet> {
+  const count = globalEnd - globalStart + 1;
+  if (count <= 0) return precompute([]);
+
+  const startByte = byteOffsets[globalStart];
+  const endByte   = (globalEnd + 1 < byteOffsets.length)
+    ? byteOffsets[globalEnd + 1]
+    : fs.statSync(filePath).size;
+
+  const rawBuf = Buffer.alloc(endByte - startByte);
+  const fd = fs.openSync(filePath, 'r');
+  fs.readSync(fd, rawBuf, 0, rawBuf.length, startByte);
+  fs.closeSync(fd);
+
+  const lines = rawBuf.toString('utf8').split('\n').filter(l => l.trim());
+  const { numVariants, variantNames, aBits, aWords, dBits, dWords, hasFlip, hasD } = meta;
+  const variantIdx = new Map<string, number>(variantNames.map((n, i) => [n, i]));
+
+  const aFlat  = new Uint32Array(count * numVariants * aWords);
+  const faFlat = hasFlip ? new Uint32Array(count * numVariants * aWords) : null;
+  const dFlat  = hasD   ? new Uint32Array(count * numVariants * dWords) : null;
+  const fdFlat = (hasD && hasFlip) ? new Uint32Array(count * numVariants * dWords) : null;
+  const tDeltaBuf = new Float32Array(count * 48);
+  const tMagBuf   = new Float32Array(count);
+
+  const compactFps: FPData[] = [];
+  let prevColorGrid: number[] | null = null;
+  let allHaveSig = true;
+
+  for (let li = 0; li < Math.min(lines.length, count); li++) {
+    let frame: any;
+    try { frame = JSON.parse(lines[li]); } catch { continue; }
+
+    for (let vi = 0; vi < numVariants; vi++) {
+      const v    = frame.variants?.[variantNames[vi]];
+      const aOff = (li * numVariants + vi) * aWords;
+      aFlat.set(hashToU32(v?.hash  ?? '', aWords), aOff);
+      if (faFlat) faFlat.set(hashToU32(v?.fhash ?? '', aWords), aOff);
+      if (dFlat) {
+        const dOff = (li * numVariants + vi) * dWords;
+        dFlat.set(hashToU32(v?.dhash  ?? '', dWords), dOff);
+        if (fdFlat) fdFlat.set(hashToU32(v?.fdhash ?? '', dWords), dOff);
+      }
+    }
+
+    const sig = frame.signature as FrameSignature | undefined;
+    if (sig?.colorGrid?.length === 48 && prevColorGrid && li > 0) {
+      let mag = 0;
+      for (let k = 0; k < 48; k++) {
+        const d = sig.colorGrid[k] - prevColorGrid[k];
+        tDeltaBuf[li * 48 + k] = d;
+        mag += d * d;
+      }
+      tMagBuf[li] = Math.sqrt(mag);
+    }
+    prevColorGrid = sig?.colorGrid ?? null;
+    if (!sig || sig.colorGrid?.length !== 48) allHaveSig = false;
+
+    compactFps.push({
+      frameIndex: frame.frameIndex,
+      timestamp:  frame.timestamp,
+      variants:   {},
+      signature:  sig,
+    } as FPData);
+  }
+
+  return {
+    fps: compactFps,
+    variantNames, numVariants, variantIdx,
+    aFlat, faFlat,
+    dFlat:  hasD            ? dFlat!  : null,
+    fdFlat: (hasD && hasFlip) ? fdFlat! : null,
+    aBits, aWords, dBits, dWords,
+    tDelta: (allHaveSig && compactFps.length > 1) ? tDeltaBuf : null,
+    tMag:   (allHaveSig && compactFps.length > 1) ? tMagBuf   : null,
+  };
+}
+
+/** Estimate bytes consumed by a fully-loaded movie PreSet. */
+function estimateMoviePresetBytes(
+  frameCount:  number,
+  numVariants: number,
+  aWords:      number,
+  dWords:      number,
+): number {
+  return (
+    frameCount * numVariants * (aWords + dWords) * 2 * 4 + // aFlat + dFlat + mirrors
+    frameCount * 48 * 4 +                                   // tDelta
+    frameCount * 4 +                                        // tMag
+    frameCount * 1_400                                      // JS objects + signatures
+  );
+}
+
+/**
+ * Chunked matching orchestrator.
+ *
+ * Strategy:
+ *  1. Build a byte-offset index for the movie NDJSON (single fast pass).
+ *  2. Scan the movie in CHUNK_FRAMES-frame windows; for each window build a
+ *     small PreSet, run hashSimFastCross against the short scene seeds, and
+ *     accumulate global candidate lists.  The window is immediately freed.
+ *  3. For each scene chunk, verify the top candidates and run a bounded
+ *     bidirectional walk using a ±WALK_WINDOW frame window around the seed.
+ *  4. Post-process (merge, dedup, context-validate) exactly as the full path.
+ *
+ * RAM peak ≈ max(CHUNK_FRAMES, 2×WALK_WINDOW) × bytes_per_frame, not
+ * totalFrames × bytes_per_frame.
+ */
+async function groundMatchedSegmentsChunked(
+  shortSet:       PreSet,
+  movieFilePath:  string,
+  byteOffsets:    Float64Array,
+  movieMetaFps:   FPData[],           // lightweight global fps (timestamps only, no hashes)
+  meta:           VariantMeta,
+  minSimilarity:  number,
+  minConsFrames:  number,
+  frameDrift:     number,
+): Promise<MatchResult> {
+  const CHUNK_FRAMES = 10_000;  // movie frames per scan window (~4 MB aFlat for 13v/8w)
+  const WALK_WINDOW  = 3_000;   // half-width around each seed for the bidirectional walk
+
+  const shortFps        = shortSet.fps;
+  const totalMovieFrames = movieMetaFps.length;
+  const fastFloor        = minSimilarity - 20;
+
+  // ── 1. Scene cut detection on short clip ─────────────────────────────────
+  const isCut  = detectSceneCuts(shortSet);
+  const chunks = splitBySceneCuts(shortFps, isCut);
+  console.log(
+    `[MatchChunked] ${chunks.length} scene chunk(s) in short clip.` +
+    ` Scanning ${totalMovieFrames} movie frames in chunks of ${CHUNK_FRAMES}…`
+  );
+
+  // Collect seed candidate lists: allCands[si] = [{mi_global, sim}, ...]
+  const allCands = new Map<number, Array<{ mi: number; sim: number }>>();
+
+  // Seed positions to probe (5 strategic points per scene chunk)
+  const seedSiSet = new Set<number>();
+  for (const sc of chunks) {
+    const sz = sc.end - sc.start + 1;
+    for (let p = 0; p <= 4; p++) {
+      seedSiSet.add(sc.start + Math.round(p * (sz - 1) / 4));
+    }
+  }
+  for (const si of seedSiSet) allCands.set(si, []);
+
+  // ── 2. Chunked scan ───────────────────────────────────────────────────────
+  for (let chunkStart = 0; chunkStart < totalMovieFrames; chunkStart += CHUNK_FRAMES) {
+    const chunkEnd = Math.min(chunkStart + CHUNK_FRAMES - 1, totalMovieFrames - 1);
+    const chunkSet = await loadMovieWindowPreset(movieFilePath, byteOffsets, chunkStart, chunkEnd, meta);
+    const chunkLen = chunkEnd - chunkStart + 1;
+
+    for (const si of seedSiSet) {
+      const list = allCands.get(si)!;
+      let lastCand: { mi: number; sim: number } | null = null;
+
+      for (let localMi = 0; localMi < chunkLen; localMi++) {
+        const s = hashSimFastCross(shortSet, si, chunkSet, localMi);
+        if (s < fastFloor) continue;
+        const globalMi = chunkStart + localMi;
+        if (lastCand && globalMi - lastCand.mi < SEED_SEPARATION) {
+          if (s > lastCand.sim) lastCand.sim = s;
+        } else {
+          lastCand = { mi: globalMi, sim: s };
+          list.push(lastCand);
+        }
+      }
+
+      // Prune to top MAX_SEED_CANDIDATES periodically to cap list growth
+      if (list.length > MAX_SEED_CANDIDATES * 4) {
+        list.sort((a, b) => b.sim - a.sim);
+        list.splice(MAX_SEED_CANDIDATES * 2);
+      }
+    }
+
+    console.log(`[MatchChunked] Scanned frames ${chunkStart}–${chunkEnd}`);
+  }
+
+  // Final sort + trim
+  for (const [, list] of allCands) {
+    list.sort((a, b) => b.sim - a.sim);
+    if (list.length > MAX_SEED_CANDIDATES) list.splice(MAX_SEED_CANDIDATES);
+  }
+
+  // ── 3. Passes 1 & 2: walk from seeds ─────────────────────────────────────
+  const usedShort = new Uint8Array(shortFps.length);
+  const segments: MatchedSegment[] = [];
+
+  for (let pass = 1; pass <= 2; pass++) {
+    const passMinSim = pass === 1 ? minSimilarity : 40;
+    const isApprox   = pass === 2;
+    let   passCount  = 0;
+
+    for (const sc of chunks) {
+      const scSize = sc.end - sc.start + 1;
+      let hasUnmatched = false;
+      for (let si = sc.start; si <= sc.end; si++) {
+        if (!usedShort[si]) { hasUnmatched = true; break; }
+      }
+      if (!hasUnmatched) continue;
+
+      const chunkMinFrames = Math.min(minConsFrames, Math.max(3, Math.floor(scSize * 0.4)));
+      const seedPositions  = new Set<number>();
+      for (let p = 0; p <= 4; p++) {
+        seedPositions.add(sc.start + Math.round(p * (scSize - 1) / 4));
+      }
+
+      let bestSeq: RawSeq[] | null = null;
+      let bestSeqConf = 0;
+      let bestWinStart = 0;
+
+      for (const scanSi of seedPositions) {
+        let si = scanSi;
+        if (usedShort[si]) {
+          let found = false;
+          for (let d = 1; d <= scSize; d++) {
+            if (si + d <= sc.end && !usedShort[si + d]) { si = si + d; found = true; break; }
+            if (si - d >= sc.start && !usedShort[si - d]) { si = si - d; found = true; break; }
+          }
+          if (!found) continue;
+        }
+
+        const cands = (allCands.get(si) ?? []).filter(c => c.sim >= passMinSim - 18);
+        if (cands.length === 0) continue;
+
+        for (const cand of cands.slice(0, MAX_SEED_CANDIDATES)) {
+          const winStart = Math.max(0, cand.mi - WALK_WINDOW);
+          const winEnd   = Math.min(totalMovieFrames - 1, cand.mi + WALK_WINDOW);
+          const localMi  = cand.mi - winStart;
+
+          const winSet  = await loadMovieWindowPreset(movieFilePath, byteOffsets, winStart, winEnd, meta);
+          const seedSim = frameSim(shortSet, si, winSet, localMi);
+          if (seedSim < passMinSim) continue;
+
+          const seq = buildSegment(shortSet, winSet, si, localMi, seedSim,
+            usedShort, isCut, frameDrift, sc.start, sc.end);
+          if (seq.length < chunkMinFrames) continue;
+
+          const conf = seq.reduce((a, f) => a + f.sim, 0) / seq.length;
+          if (bestSeq === null || seq.length > bestSeq.length ||
+              (seq.length === bestSeq.length && conf > bestSeqConf)) {
+            bestSeq      = seq;
+            bestSeqConf  = conf;
+            bestWinStart = winStart;
+          }
+        }
+      }
+
+      if (!bestSeq) continue;
+
+      // Convert window-local mi → global mi; use movieMetaFps (global timestamps)
+      const globalSeq = bestSeq.map(f => ({ ...f, mi: f.mi + bestWinStart }));
+      for (const item of globalSeq) usedShort[item.si] = 1;
+      segments.push(acceptSegment(globalSeq, shortFps, movieMetaFps, isApprox));
+      passCount++;
+    }
+
+    console.log(`[MatchChunked] Pass ${pass} (minSim=${passMinSim}%): ${passCount} chunk(s) matched.`);
+  }
+
+  // ── 4. Pass 3: forced best-match ─────────────────────────────────────────
+  const MIN_FORCED_FRAMES = 10;
+  for (const sc of chunks) {
+    const remaining: number[] = [];
+    for (let si = sc.start; si <= sc.end; si++) {
+      if (!usedShort[si]) remaining.push(si);
+    }
+    if (remaining.length === 0 || remaining.length < MIN_FORCED_FRAMES) continue;
+
+    console.log(`[MatchChunked] Pass 3 (forced): chunk [${sc.start}–${sc.end}], ${remaining.length} frames`);
+
+    const bestOf: Array<{ si: number; mi: number; sim: number }> = [];
+    for (const si of remaining) {
+      const cands = allCands.get(si) ?? [];
+      if (cands.length > 0) bestOf.push({ si, mi: cands[0].mi, sim: cands[0].sim });
+    }
+
+    const avgSim = bestOf.length > 0 ? bestOf.reduce((s, f) => s + f.sim, 0) / bestOf.length : 0;
+    if (avgSim < 65) continue;
+
+    let k = 0;
+    while (k < bestOf.length) {
+      const group = [bestOf[k]];
+      let curMi   = bestOf[k].mi;
+      for (let j = k + 1; j < bestOf.length; j++) {
+        const item  = bestOf[j];
+        const siGap = item.si - bestOf[j - 1].si;
+        if (Math.abs(item.mi - (curMi + siGap)) <= LOOK_AHEAD * 2) {
+          group.push(item); curMi = item.mi;
+        } else break;
+      }
+      for (const item of group) usedShort[item.si] = 1;
+      segments.push(acceptSegment(group, shortFps, movieMetaFps, true));
+      k += Math.max(1, group.length);
+    }
+  }
+
+  // ── 5. Post-process (same as full path) ───────────────────────────────────
+  const merged = mergeAdjacentSegments(segments);
+  console.log(`[MatchChunked] After merge: ${merged.length} segment(s) (was ${segments.length}).`);
+
+  merged.sort((a, b) => b.confidence - a.confidence);
+  const deduped: MatchedSegment[] = [];
+  for (const seg of merged) {
+    const overlaps = deduped.some(k => {
+      const oStart = Math.max(k.shortStart, seg.shortStart);
+      const oEnd   = Math.min(k.shortEnd,   seg.shortEnd);
+      return oEnd - oStart > 0.15;
+    });
+    if (!overlaps) deduped.push(seg);
+  }
+  deduped.sort((a, b) => a.shortStart - b.shortStart);
+
+  const validated = contextValidateSegments(deduped);
+  if (validated.length !== deduped.length) {
+    console.log(`[MatchChunked] Context validation: dropped ${deduped.length - validated.length} segment(s).`);
+  }
+
+  const tToSi = new Map<string, number>();
+  shortFps.forEach((fp, si) => tToSi.set(fp.timestamp.toFixed(4), si));
+  const usedFinal = new Uint8Array(shortFps.length);
+  for (const seg of validated) {
+    for (const frame of seg.matchSequence) {
+      const si = tToSi.get(frame.shortTime.toFixed(4));
+      if (si !== undefined) usedFinal[si] = 1;
+    }
+  }
+
+  console.log(`[MatchChunked] Final: ${validated.length} segment(s).`);
+  return { segments: validated, unmatchedRanges: computeUnmatched(shortFps, usedFinal) };
+}
+
 /**
  * Memory-efficient public API: builds both PreSets by streaming their
  * fingerprint files then runs the full matching pipeline.
  *
- * Peak RAM for a 2-hour movie is ~400 MB instead of ~7 GB.
+ * Automatically switches to the chunked path when the estimated movie PreSet
+ * RAM exceeds 4 GB or when available system RAM is tight (< 2 GB headroom).
+ *
+ * Peak RAM for a 2-hour movie on the full path:  ~350 MB
+ * Peak RAM for a 10-hour movie on the full path: ~1.7 GB
+ * Chunked path cap: max(CHUNK_FRAMES, 2×WALK_WINDOW) frames in RAM at once
  */
 export async function matchVideosFromFiles(
   shortResultPath: string,
@@ -1550,19 +1989,61 @@ export async function matchVideosFromFiles(
   } = {}
 ): Promise<MatchResult & { movieFrames: number; shortFrames: number }> {
   const {
-    minSimilarity       = 82,
+    minSimilarity        = 82,
     minConsecutiveFrames = 9,
-    frameDrift          = 3,
+    frameDrift           = 3,
   } = opts;
 
   console.log('[Match] Streaming precompute: short fingerprints…');
   const shortPreSet = await streamPrecomputeFromFile(shortResultPath);
+  const shortFrames = shortPreSet.fps.length;
 
+  // ── Decide: full load vs chunked ──────────────────────────────────────────
+  // Peek at movie frame count via line index (fast: one sequential pass).
+  // This also gives us byte offsets ready for the chunked path if needed.
+  console.log('[Match] Building movie line index…');
+  const { byteOffsets, totalFrames: movieFrames, meta } = await buildMovieLineIndex(movieResultPath);
+
+  const estimatedBytes = estimateMoviePresetBytes(
+    movieFrames, meta.numVariants || 13, meta.aWords || 8, meta.dWords || 0
+  );
+  const RAM_MATCH_LIMIT = 4 * 1024 * 1024 * 1024; // 4 GB
+  const freeRam         = os.freemem();
+  const useChunked      = estimatedBytes > RAM_MATCH_LIMIT || estimatedBytes > freeRam - 500_000_000;
+
+  console.log(
+    `[Match] Movie: ${movieFrames} frames — estimated PreSet ${(estimatedBytes / 1e9).toFixed(2)} GB` +
+    ` — free RAM ${(freeRam / 1e9).toFixed(2)} GB — path: ${useChunked ? 'CHUNKED' : 'full-load'}`
+  );
+
+  if (useChunked) {
+    // ── Chunked path ─────────────────────────────────────────────────────────
+    // Load movie metadata (timestamps only; no hashes) for acceptSegment
+    console.log('[Match] Loading movie metadata (timestamps)…');
+    const movieMetaFps: FPData[] = [];
+    const rl = readline.createInterface({
+      input: fs.createReadStream(movieResultPath, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      try {
+        const f = JSON.parse(line);
+        movieMetaFps.push({ frameIndex: f.frameIndex, timestamp: f.timestamp, variants: {}, signature: undefined });
+      } catch { /* skip */ }
+    }
+
+    const result = await groundMatchedSegmentsChunked(
+      shortPreSet, movieResultPath, byteOffsets, movieMetaFps, meta,
+      minSimilarity, minConsecutiveFrames, frameDrift
+    );
+    return { ...result, movieFrames, shortFrames };
+  }
+
+  // ── Full-load path (unchanged) ────────────────────────────────────────────
   console.log('[Match] Streaming precompute: movie fingerprints…');
   const moviePreSet = await streamPrecomputeFromFile(movieResultPath);
 
-  const shortFrames = shortPreSet.fps.length;
-  const movieFrames = moviePreSet.fps.length;
   console.log(`[Match] Loaded ${movieFrames} movie frames, ${shortFrames} short frames. Running matching…`);
 
   const result = await groundMatchedSegments(

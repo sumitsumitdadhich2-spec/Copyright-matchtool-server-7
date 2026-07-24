@@ -1,3 +1,4 @@
 - [Canvas native addon fix](canvas-libuuid-fix.md) — libuuid.so.1 not found by canvas.node on this NixOS host; fixed with symlink.
 - [Worker thread TypeScript loading](worker-ts-loading.md) — `--import tsx` fails for worker_threads; use `-r tsx/cjs` or eval bootstrap.
 - [Sanity test design](sanity-test-design.md) — test must compare worker-to-worker (determinism), not main-thread vs worker (different pipelines).
+- [RAM management](ram-management.md) — extraction queue limit must be dynamic (frame resolution × count); hardcoded 100 crashes 8 GB RAM with 4K video. Matching uses chunked path auto when estimated PreSet > 4 GB.
