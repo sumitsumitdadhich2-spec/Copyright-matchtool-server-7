@@ -6,7 +6,7 @@ import type { GoogleGenAI } from '@google/genai'
 import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
 import { preparePrescanMovieCopy, buildBackupClip } from './ffmpeg'
-import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, RATE_COOLDOWN_MS, type ModelSpec } from './models'
+import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, type ModelSpec } from './models'
 import {
   getClient,
   uploadVideo,
@@ -108,6 +108,8 @@ interface Ctrl {
   backupInFlight: Set<number>
   nextFreeAt: Record<string, number>
   cooldownUntil: Record<string, number>
+  /** Active request in flight per API key ID — ensures AT MOST 1 request per key at any instant! */
+  activeKeys: Set<string>
   /** in-flight re-uploads per key (after a file-expired error) */
   reuploads: Map<string, Promise<GeminiPrescanUpload>>
   /** in-flight backup-clip re-uploads per key */
@@ -282,6 +284,7 @@ export function startGeminiMinuteFinder(
     backupInFlight: new Set(),
     nextFreeAt: {},
     cooldownUntil: {},
+    activeKeys: new Set(),
     reuploads: new Map(),
     clipReuploads: new Map(),
   }
@@ -336,6 +339,7 @@ export async function stopAndWaitMinuteFinder(scanId: string, reason: string, ti
 
 /** Stop: hand every in-flight window (both passes) back to pending so Retry resumes it. */
 function resetRunningWindows(ctrl: Ctrl) {
+  ctrl.activeKeys?.clear()
   for (const w of ctrl.state.windows) if (w.status === 'running') w.status = 'pending'
   const b = ctrl.state.backup
   if (b) {
@@ -467,7 +471,18 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     const keyId = apiKeyHash(k)
     const availableLanes = CHUNK_MODEL_POOL.filter((m) => getModelUsage(m.id, k) < m.rpd)
     const totalRemaining = CHUNK_MODEL_POOL.reduce((sum, m) => sum + Math.max(0, m.rpd - getModelUsage(m.id, k)), 0)
-    const hasCachedUploads = Boolean(ctrl.state.uploads[keyId]?.movieCopy && ctrl.state.uploads[keyId]?.short)
+    const sObj = getScan(id)
+    const hasCachedUploads = Boolean(
+      (ctrl.state.uploads[keyId]?.movieUri && ctrl.state.uploads[keyId]?.shortUri) ||
+      (sObj && findReusableGeminiMovieUpload(
+        sObj.movieName || '',
+        sObj.movieSize || 0,
+        keyId,
+        ctrl.state.movieCopy?.trimStart ?? 0,
+        ctrl.state.movieCopy?.trimEnd ?? sObj.movieDuration ?? 0,
+        id,
+      ))
+    )
     return {
       keyIdx: i + 1,
       apiKey: k,
@@ -493,16 +508,17 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     return b.totalRemaining - a.totalRemaining
   })
 
-  // Pick top 2-3 keys that have remaining quota (prioritizing cached uploads for 0s wait)
+  // Pick keys that have remaining quota (prioritizing cached uploads for 0s wait)
   const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
   const pool = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
-  const maxKeysForPrescan = Math.min(pool.length, Math.max(2, Math.min(3, Math.ceil(total / 2))))
+  const neededKeys = Math.max(1, Math.min(3, Math.ceil(total / 2)))
+  const maxKeysForPrescan = Math.min(pool.length, Math.max(1, neededKeys))
   const selectedKeys = pool.slice(0, maxKeysForPrescan)
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${selectedKeys.length} keys)...` })
   let uploadedKeys = 0
   const uploadResults: boolean[] = new Array(selectedKeys.length).fill(false)
-  const UPLOAD_CONCURRENCY = 2
+  const UPLOAD_CONCURRENCY = Math.min(4, selectedKeys.length)
   let keyCursor = 0
   const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, selectedKeys.length) }, async () => {
     while (keyCursor < selectedKeys.length) {
@@ -798,16 +814,33 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
   while (true) {
     if (ctrl.stopping || lane.dead) return
 
-    const cool = ctrl.cooldownUntil[rk] || 0
+    // Key exclusivity: only 1 window request active per API key at any given moment.
+    // 20-min window takes ~190K tokens; running 2+ simultaneously on the same key exceeds 250K TPM!
+    if (ctrl.activeKeys.has(lane.keyId)) {
+      await sleep(1000)
+      continue
+    }
+
+    const keyCool = ctrl.cooldownUntil[lane.keyId] || 0
+    const cool = Math.max(keyCool, ctrl.cooldownUntil[rk] || 0)
     if (cool > Date.now()) {
       await sleep(Math.min(2000, cool - Date.now()))
+      continue
+    }
+
+    // Pacing spacing check before pulling from queue:
+    const keyWait = (ctrl.nextFreeAt[lane.keyId] || 0) - Date.now()
+    const laneWait = (ctrl.nextFreeAt[rk] || 0) - Date.now()
+    const wait = Math.max(keyWait, laneWait)
+    if (wait > 0) {
+      await sleep(Math.min(2000, wait))
       continue
     }
 
     // Global Coordinator Availability check:
     // If this specific lane is currently busy in another scan or in pacing delay,
     // sleep 1 second and DO NOT pop from queue yet.
-    // This allows any other idle/free lane (e.g. Key 3 · 3.8, Key 2 · 3.6) to pop the window immediately!
+    // This allows any other idle/free lane (e.g. other keys) to pop the window immediately!
     const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, lane.model.id, 0)
     if (laneBusy.busy) {
       await sleep(1000)
@@ -824,11 +857,13 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
     if (!w || w.status !== 'pending') continue
 
     inFlight.add(idx)
+    ctrl.activeKeys.add(lane.keyId)
     w.status = 'running'
     w.lane = lane.label
     w.error = undefined
     persist(id, ctrl)
 
+    const winDur = Math.max(60, Math.round(w.endOffset - w.startOffset))
     let releaseGlobalLock: ((sec?: number) => void) | null = null
     try {
       releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
@@ -839,15 +874,11 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         modelId: lane.model.id,
         slot: 0,
         operation: `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)})`,
-        videoSeconds: 60,
+        videoSeconds: winDur,
         onWait: (msg) => log(id, 'info', msg),
         isStopping: () => ctrl.stopping,
       })
 
-      // Pacing: 1 request per minute per lane (TPM 250K). Uploads are already
-      // done, so the wait is pure spacing.
-      const wait = (ctrl.nextFreeAt[rk] || 0) - Date.now()
-      if (wait > 0) await sleep(wait)
       if (ctrl.stopping) {
         w.status = 'pending'
         persist(id, ctrl)
@@ -865,6 +896,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         return
       }
 
+      ctrl.nextFreeAt[lane.keyId] = Date.now() + MODEL_MIN_INTERVAL_MS
       ctrl.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
       w.attempts = (w.attempts || 0) + 1
       const clipFps = ctrl.state.backup?.clip?.fps
@@ -923,12 +955,14 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         queue.push(idx)
         log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rate') {
-        // 429 RPM/TPM: cooldown, then send the SAME request again (unlimited).
-        globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, RATE_COOLDOWN_MS, 0)
-        ctrl.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
+        // 429 RPM/TPM: progressive cooldown (15s, 30s, 60s) instead of flat 60s lockup
+        const coolMs = Math.min(60_000, 15_000 * Math.pow(2, (w.attempts || 1) - 1))
+        globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
+        ctrl.cooldownUntil[lane.keyId] = Date.now() + coolMs
+        ctrl.cooldownUntil[rk] = Date.now() + coolMs
         w.status = 'pending'
         queue.push(idx)
-        log(id, 'warn', `${tag} #${w.index}: 429 on ${lane.label} — 60s cooldown, re-queued: ${e.message.slice(0, 100)}`)
+        log(id, 'warn', `${tag} #${w.index}: 429/rate on ${lane.label} — ${Math.round(coolMs / 1000)}s cooldown, re-queued: ${e.message.slice(0, 120)}`)
       } else if (isFileGoneError(e.message)) {
         w.status = 'pending'
         queue.push(idx)
@@ -953,7 +987,8 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       }
       persist(id, ctrl)
     } finally {
-      if (releaseGlobalLock) releaseGlobalLock(60)
+      ctrl.activeKeys.delete(lane.keyId)
+      if (releaseGlobalLock) releaseGlobalLock(winDur)
       inFlight.delete(idx)
     }
   }

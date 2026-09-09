@@ -61,8 +61,8 @@ import { globalGeminiCoordinator } from './global-gemini-coordinator'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Max attempts per chunk before it is marked failed (capped strictly at 4 to protect API quota). */
-const MAX_CHUNK_ATTEMPTS = 4
+/** Max real attempts per chunk before it is marked failed (infra/transient/rate errors never count). */
+const MAX_CHUNK_ATTEMPTS = 6
 
 /** One API key lane (1-20). Gemini Files API uploads are PER KEY,
  *  so each lane keeps its own uploaded short-SEGMENT URIs (one per minute). */
@@ -84,13 +84,12 @@ interface KeyLane {
   verifyActiveByModel: Map<string, number>
 }
 
-/** Concurrency per model on each API key: 3 requests simultaneously.
- * TPM 250K cap ke andar clips <= 4s hone par token load bohot kam rehta hai,
- * isliye safe hai aur verify speed kafi fast ho jati hai. */
-const VERIFY_CONCURRENCY_PER_MODEL = 3
+/** Concurrency per model on each API key: 1 request per model slot.
+ * Across 16 keys × 2 verify models = 32 parallel verify requests across the pool!
+ * This prevents saturating individual API keys and stopping rate limit storms. */
+const VERIFY_CONCURRENCY_PER_MODEL = 1
 
-/** Max verifier groups in flight per key: 2 models × 3 requests = 6 simultaneous requests per key.
- * 5 keys hone par = 30 simultaneous verify requests in parallel. */
+/** Max verifier groups in flight per key: 2 models × 1 request = 2 simultaneous requests per key. */
 const VERIFY_PER_LANE = VERIFY_MODEL_POOL.length * VERIFY_CONCURRENCY_PER_MODEL
 
 interface Job {
@@ -501,18 +500,6 @@ class Scheduler {
     const scan = job ? job.scan : getScan(scanId)
     if (!scan) return { ok: false, error: 'Scan not found' }
 
-    // RESCAN LOCK: a manual retry NEVER starts while the verification queue has
-    // pending candidates — verification must fully drain first.
-    const pendingVerify = (scan.candidateGroups || []).filter(
-      (g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning',
-    ).length
-    if (pendingVerify > 0) {
-      return {
-        ok: false,
-        error: `Verification in progress — ${pendingVerify} candidate group(s) pending. Retry tabhi milega jab saare candidates verify ho jayen${job ? '' : ' (Resume karke verification poori karo)'}.`,
-      }
-    }
-
     // Resolve the target segment (default: the current/selected minute).
     let seg: ShortSegmentState | null = null
     let chunk: ChunkState | undefined
@@ -525,6 +512,21 @@ class Scheduler {
       chunk = scan.chunks?.[chunkIndex]
     }
     if (!chunk) return { ok: false, error: `Chunk ${chunkIndex} not found` }
+
+    const isFailedChunk = chunk.status === 'failed'
+
+    // RESCAN LOCK: a manual retry on matched/no_match chunks waits while the verification
+    // queue has pending candidates. But a FAILED chunk has no pending verifications and
+    // must be immediately retryable so the user is never stuck!
+    const pendingVerify = (scan.candidateGroups || []).filter(
+      (g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning',
+    ).length
+    if (pendingVerify > 0 && !isFailedChunk) {
+      return {
+        ok: false,
+        error: `Verification in progress — ${pendingVerify} candidate group(s) pending. Retry tabhi milega jab saare candidates verify ho jayen${job ? '' : ' (Resume karke verification poori karo)'}.`,
+      }
+    }
 
     const isActiveSeg = !seg || !job || job.seg === seg
     if ((chunk.status === 'scanning' || job?.inFlight.has(chunkIndex)) && isActiveSeg) {
@@ -1697,10 +1699,10 @@ class Scheduler {
     }
   }
 
-  /** BACKUP-PREUPLOAD + BUSY-RETRY (verify/rescan):
-   *  Clip ki 1 backup copy parallel background me upload hoti hai.
-   *  Primary request success hote hi backup turant DELETE ho jata hai (zero unnecessary requests).
-   *  Agar primary request busy/503/429 fail ho to bina upload wait ke TURANT backup URI se retry hota hai. */
+  /** BUSY-RETRY (verify/rescan):
+   *  Primary request is sent with the uploaded clip.
+   *  On 503/server overload, retries after 2s backoff.
+   *  On 429 rate limit, throws immediately to trigger model cooldown and re-queue across workers. */
   private async sendWithClipBackup(
     job: Job,
     lane: KeyLane,
@@ -1710,31 +1712,22 @@ class Scheduler {
     send: (uri: string) => Promise<string>,
     busyLabel: string,
   ): Promise<string> {
-    let pendingBackup: Promise<{ uri: string; name: string }> | null = uploadVideo(lane.ai, filePath)
-    pendingBackup.catch(() => {})
     try {
-      let raw: string
-      try {
-        raw = await send(mainUri)
-      } catch (err) {
-        const e = classifyError(err)
-        const transient =
-          e.kind === 'rate' || /overload|busy|503|500|internal|try again|temporarily/i.test(e.message)
-        const backup = transient && pendingBackup ? await pendingBackup.catch(() => null) : null
-        if (!backup) throw err
-        pendingBackup = null
-        uploadedNames.push(backup.name)
-        addLog(job.scan, 'warn', `${busyLabel}: API busy — pre-uploaded backup clip se turant retry (upload wait zero)`)
-        this.mark(job)
-        raw = await send(backup.uri)
-      }
-      return raw
-    } finally {
-      // Primary success ya failure — unused backup ko bina kisi deri ke turant delete karo
-      if (pendingBackup) {
-        void pendingBackup.then((f) => deleteFileQuiet(lane.ai, f.name)).catch(() => {})
-        pendingBackup = null
-      }
+      return await send(mainUri)
+    } catch (err) {
+      const e = classifyError(err)
+      // Rate limits (429) MUST NOT be retried immediately on the same key!
+      // Throw immediately so the lane rate-limit cooldown and re-queue kick in cleanly.
+      if (e.kind === 'rate') throw err
+
+      // On temporary server errors (503/overload), wait 2s and retry with the active clip URI
+      const transient = /overload|busy|503|500|internal|try again|temporarily/i.test(e.message)
+      if (!transient) throw err
+
+      addLog(job.scan, 'warn', `${busyLabel}: API server busy (503/overload) — retrying in 2s...`)
+      this.mark(job)
+      await sleep(2000)
+      return await send(mainUri)
     }
   }
 
@@ -2297,16 +2290,6 @@ class Scheduler {
         const [shortUri, uploaded] = await uploadsP
         chunkFileName = uploaded.name
 
-        // BACKUP PRE-UPLOAD (Parallel zero-wait insurance):
-        // Primary request chalu hone ke saath hi backup copy background me upload hoti hai.
-        // Primary request success hote hi backup turant DELETE ho jata hai.
-        // Agar primary busy/503/429 ho to bina upload wait ke backup URI se instant retry hota hai.
-        let pendingBackup: Promise<{ uri: string; name: string }> | null = (async () => {
-          const file = await this.ensureChunkFile(scan, chunkIndex)
-          return uploadVideo(lane.ai, file)
-        })()
-        pendingBackup.catch(() => {})
-
         job.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
 
         addLog(scan, 'info', `${minutePrefix}Chunk ${chunkIndex}: mapping short → movie minute ${chunkIndex} on ${m.id} (key ${lane.idx})`)
@@ -2318,24 +2301,19 @@ class Scheduler {
         try {
           raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
         } catch (reqErr) {
-          // TRANSIENT-BUSY RETRY: API/model busy (overloaded / 5xx / rate) par
-          // pre-uploaded backup se TURANT retry (upload wait zero).
           const re = classifyError(reqErr)
-          const transient =
-            re.kind === 'rate' || /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
-          const backup = transient && pendingBackup ? await pendingBackup.catch(() => null) : null
-          if (!backup) throw reqErr
-          pendingBackup = null
-          backupNames.push(backup.name)
-          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: API busy on ${m.id} (key ${lane.idx}) — pre-uploaded backup se turant retry (upload wait zero)`)
+          // RATE LIMIT (429): do NOT retry immediately with zero wait on the same key!
+          // Throw immediately so it enters cooldown and is re-queued for another key.
+          if (re.kind === 'rate') throw reqErr
+
+          // On temporary server errors (503 / overload / 5xx), do ONE retry with 2s backoff
+          const isServerOverload = /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
+          if (!isServerOverload) throw reqErr
+
+          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: Gemini model server busy (503/overload) on ${m.id} (key ${lane.idx}) — retrying in 2s...`)
           this.mark(job)
-          raw = await mapChunkRequest(lane.ai, m.id, shortUri, backup.uri)
-        } finally {
-          // Primary request success ya final exit — unused backup ko bina kisi deri ke turant delete karo
-          if (pendingBackup) {
-            void pendingBackup.then((f) => deleteFileQuiet(lane.ai, f.name)).catch(() => {})
-            pendingBackup = null
-          }
+          await sleep(2000)
+          raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
         }
 
         const used = incrementModelUsage(m.id, lane.apiKey)
@@ -2360,7 +2338,6 @@ class Scheduler {
             shortEnd: seg.start + Math.min(Math.max(0, mm.shortEnd), segLocalDur),
           }))
           .filter((mm) => mm.shortEnd - mm.shortStart > 0.02)
-        chunk.attempts += 1
 
         // FALSE-RESULT DETECTOR: no NOT FOUND anywhere / fixed-offset A-to-Z
         // extrapolation => auto retry ONCE, then accept whatever comes.
@@ -2394,11 +2371,25 @@ class Scheduler {
         this.mark(job)
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        chunk.attempts = (chunk.attempts || 0) + 1
+
+        // INFRASTRUCTURE / TRANSIENT ERROR CHECK:
+        // Quota limits, rate limits, model exhaustions, temporary 503s, and network/upload hiccups
+        // are properties of the API key/Gemini service — NEVER the chunk video itself!
+        // These MUST NOT consume chunk.attempts, so transient bursts never mark a chunk as 'failed'!
+        const isTransientInfra =
+          e.kind === 'rate' ||
+          e.kind === 'rpd' ||
+          e.kind === 'unavailable' ||
+          e.kind === 'invalid_key' ||
+          /file upload|processing timed out|socket|econnreset|etimedout|500|502|503|504|overload/i.test(e.message)
+
+        if (!isTransientInfra) {
+          chunk.attempts = (chunk.attempts || 0) + 1
+        }
 
         if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
           chunk.status = 'failed'
-          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped to protect quota: ${e.message.slice(0, 140)}`)
+          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${e.message.slice(0, 140)}`)
         } else if (e.kind === 'invalid_key') {
           for (const mm of MODEL_POOL) {
             setModelExhausted(mm.id, lane.apiKey, mm.rpd)
@@ -2411,7 +2402,7 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued for another key`)
+          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
           globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0)
           setModelExhausted(m.id, lane.apiKey, m.rpd)
@@ -2422,13 +2413,13 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} re-queued for another worker`)
         } else if (e.kind === 'rate') {
           globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, 0)
           job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued`)
+          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} safely re-queued for another worker/key`)
         } else {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

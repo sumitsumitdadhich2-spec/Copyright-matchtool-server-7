@@ -355,7 +355,10 @@ class GlobalGeminiCoordinator {
 
   private releaseLane(lane: GlobalLaneState, videoSeconds: number) {
     const paceMs = pacingIntervalMs(videoSeconds)
-    lane.nextFreeAt = Date.now() + paceMs
+    // Pace from when the request became active (sliding TPM window) rather than blindly adding full paceMs after completion
+    const elapsedSinceActive = lane.activeSince ? Math.max(0, Date.now() - lane.activeSince) : 0
+    const remainingPaceMs = Math.max(0, paceMs - elapsedSinceActive)
+    lane.nextFreeAt = Date.now() + remainingPaceMs
     lane.activeScanId = null
     lane.activeScanTitle = null
     lane.activeOperation = null
@@ -365,7 +368,7 @@ class GlobalGeminiCoordinator {
     if (lane.waiters.length > 0) {
       setTimeout(() => {
         void this.processNext(lane)
-      }, paceMs + 20)
+      }, remainingPaceMs + 20)
     }
   }
 
@@ -419,14 +422,37 @@ class GlobalGeminiCoordinator {
 
   /** Report a 429 Rate Limit error on a lane across the entire app */
   public reportRateLimit(apiKey: string, modelId: string, cooldownMs: number = RATE_COOLDOWN_MS, slot: number = 0) {
+    const kh = apiKeyHash(apiKey)
+    const now = Date.now()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    lane.cooldownUntil = Math.max(lane.cooldownUntil, Date.now() + cooldownMs)
+    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
+
+    // Cooldown ALL slots for this model on this API key so other concurrent workers on the same key don't hit 429
+    for (const other of this.lanes.values()) {
+      if (other.keyHash === kh && other.modelId === modelId) {
+        other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
+      }
+    }
+    // Also give a short safety breathing room (5s) to any other models on this same API key
+    for (const other of this.lanes.values()) {
+      if (other.keyHash === kh) {
+        other.cooldownUntil = Math.max(other.cooldownUntil, now + 5000)
+      }
+    }
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
   public reportExhausted(apiKey: string, modelId: string, slot: number = 0) {
+    const kh = apiKeyHash(apiKey)
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.isExhausted = true
+
+    // Mark ALL slots for this model on this API key as exhausted!
+    for (const other of this.lanes.values()) {
+      if (other.keyHash === kh && other.modelId === modelId) {
+        other.isExhausted = true
+      }
+    }
   }
 
   /** Get snapshot summary of all active/busy lanes across the application */

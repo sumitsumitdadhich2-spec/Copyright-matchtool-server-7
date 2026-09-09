@@ -67,7 +67,7 @@ export function extractResponseText(resp: GeminiResponseLike | unknown): string 
 }
 
 export function getClient(apiKey: string): GoogleGenAI {
-  return new GoogleGenAI({ apiKey })
+  return new GoogleGenAI({ apiKey, httpOptions: { timeout: 600_000 } })
 }
 
 /** Upload a local video file to the Gemini Files API and wait until it is ACTIVE. */
@@ -126,7 +126,14 @@ export async function cleanupOrphanedGeminiFiles(
 
 export function classifyError(err: unknown): GeminiError {
   if (err instanceof GeminiError) return err
-  const msg = err instanceof Error ? err.message : String(err)
+  let msg = err instanceof Error ? err.message : String(err)
+  if (err instanceof Error && 'cause' in err && err.cause) {
+    const c = err.cause
+    const causeMsg = c instanceof Error ? c.message : String(c)
+    if (causeMsg && !msg.includes(causeMsg)) {
+      msg = `${msg} (${causeMsg})`
+    }
+  }
   const lower = msg.toLowerCase()
   // Invalid or expired API Key — must disable the lane immediately and not count attempts against the item.
   if (
