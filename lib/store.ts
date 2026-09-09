@@ -268,6 +268,7 @@ export function newScan(ownerUsername?: string): Scan {
     report: null,
     modelStates: {},
     verifierEnabled: true,
+    autoMode: true,
   }
   saveScan(scan)
   return scan

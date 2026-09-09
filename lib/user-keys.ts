@@ -136,6 +136,25 @@ export async function setUserVerifierEnabled(username: string, enabled: boolean)
   await writeUserKeys(username, { ...keys, [VERIFIER_ENABLED_SLOT]: enabled ? 'true' : 'false' })
 }
 
+// ---------------------------------------------------------------------------
+// AUTO MODE ENABLED — per-user preference stored under a reserved slot.
+// Default true (auto full-short, full-movie, auto-start window minute finder).
+// ---------------------------------------------------------------------------
+
+const AUTO_MODE_SLOT = 'autoMode'
+
+/** Whether auto-mode (full movie, full short, automatic window minute finder start) is enabled (default true). */
+export async function getUserAutoMode(username: string): Promise<boolean> {
+  const keys = await readUserKeys(username)
+  const v = keys[AUTO_MODE_SLOT]
+  return v === 'false' ? false : true
+}
+
+export async function setUserAutoMode(username: string, enabled: boolean): Promise<void> {
+  const keys = await readUserKeys(username)
+  await writeUserKeys(username, { ...keys, [AUTO_MODE_SLOT]: enabled ? 'true' : 'false' })
+}
+
 /** Delete a user's entire key file (used when the account is deleted). */
 export async function deleteUserKeys(username: string): Promise<void> {
   await deleteJSONRecord(recordFor(username))

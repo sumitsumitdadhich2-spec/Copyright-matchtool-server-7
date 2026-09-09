@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type DragEvent } from 'react'
 import { useSWRConfig } from 'swr'
-import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff } from 'lucide-react'
+import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff, Zap } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { uploadVideoStream, fmtMbps, fmtEta, UploadError, type UploadProgress, type UploadKind } from '@/lib/upload-client'
@@ -206,7 +206,15 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
 
   return (
     <section aria-label="Upload videos" className="panel">
-      <h2 className="text-sm font-semibold">Source Files</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">Source Files</h2>
+        {scan?.autoMode !== false ? (
+          <span className="flex items-center gap-1.5 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-cyan-300">
+            <Zap className="size-3 text-cyan-400" aria-hidden />
+            Auto Scan: Full movie & clip will automatically scan on upload
+          </span>
+        ) : null}
+      </div>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <Dropzone
           kind="short"

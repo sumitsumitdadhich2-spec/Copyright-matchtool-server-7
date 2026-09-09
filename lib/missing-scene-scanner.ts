@@ -8,9 +8,11 @@ import {
   deleteFileQuiet,
   verifyRequest,
   parseVerdict,
+  classifyError,
+  CHUNK_MAP_SANITIZED_PROMPT,
 } from './gemini'
 import { CHUNK_MODEL_POOL, VERIFY_MODEL_POOL } from './models'
-import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
+import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
 import { addLog, getScan, saveScan, scanMediaDir } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
@@ -481,21 +483,65 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
           releaseChunkLock = release
 
           const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
-          const resp = await runnerAi.models.generateContent({
-            model: selected.modelId,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                  { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                  { text: chunkPrompt },
-                ],
-              },
-            ],
-          })
+          let cText = ''
+          try {
+            const resp = await runnerAi.models.generateContent({
+              model: selected.modelId,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                    { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                    { text: chunkPrompt },
+                  ],
+                },
+              ],
+            })
+            cText = resp.text || ''
+          } catch (reqErr) {
+            const re = classifyError(reqErr)
+            const isPolicyBlocked =
+              re.kind === 'policy_blocked' ||
+              /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
-          const cText = resp.text || ''
+            if (isPolicyBlocked) {
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Flagged by Google Policy (PROHIBITED_CONTENT) — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
+              )
+              saveScan(scan)
+
+              // Sanitize muted chunk video
+              const sanitizedDir = path.join(mediaDir, 'sanitized')
+              fs.mkdirSync(sanitizedDir, { recursive: true })
+              const sanitizedChunkFile = path.join(sanitizedDir, `missing-chunk-${String(chunkIdx).padStart(4, '0')}-muted.mp4`)
+              if (!fs.existsSync(sanitizedChunkFile)) {
+                await sanitizeVideoMute(chunkFile, sanitizedChunkFile)
+              }
+              const sanitizedUp = await uploadVideo(runnerAi, sanitizedChunkFile, `Missing Chunk ${chunkIdx + 1} Sanitized`)
+              uploadedFilesToClean.push(sanitizedUp.name)
+
+              const sanitizedResp = await runnerAi.models.generateContent({
+                model: selected.modelId,
+                contents: [
+                  {
+                    role: 'user',
+                    parts: [
+                      { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                      { text: CHUNK_MAP_SANITIZED_PROMPT },
+                    ],
+                  },
+                ],
+              })
+              cText = sanitizedResp.text || ''
+              addLog(scan, 'success', `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Sanitized retry succeeded after policy flag bypass`)
+            } else {
+              throw reqErr
+            }
+          }
           const mapRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)\s*-->\s*(?:Movie\s*)?(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/gi
           let match: RegExpExecArray | null
 

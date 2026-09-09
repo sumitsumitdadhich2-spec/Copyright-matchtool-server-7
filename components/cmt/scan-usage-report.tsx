@@ -14,6 +14,7 @@ import {
   ChevronUp,
   XCircle,
   ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { computeScanUsage } from '@/lib/scan-usage'
@@ -64,6 +65,12 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
             <ShieldCheck className="size-3.5" />
             <span>Effective (Kaam Hua): {effectiveRequests} req</span>
           </div>
+          {errorBreakdown.prohibitedPolicy > 0 && (
+            <div className="flex items-center gap-1.5 rounded-full border border-purple-500/30 bg-purple-500/10 px-3 py-1 text-xs font-semibold text-purple-400">
+              <ShieldAlert className="size-3.5" />
+              <span>Prohibited Policy Handled: {errorBreakdown.prohibitedPolicy}</span>
+            </div>
+          )}
           {totalErrors > 0 && (
             <div className="flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-400">
               <AlertTriangle className="size-3.5" />

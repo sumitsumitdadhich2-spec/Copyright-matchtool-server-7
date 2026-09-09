@@ -70,7 +70,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean; customName?: string }
+  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean; autoMode?: boolean; customName?: string }
   let updated = false
 
   if (body.customName !== undefined) {
@@ -85,11 +85,17 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     updated = true
   }
 
+  if (body.autoMode !== undefined) {
+    const enabled = Boolean(body.autoMode)
+    scan.autoMode = enabled
+    updated = true
+  }
+
   if (updated) {
     const { saveScan } = await import('@/lib/store')
     saveScan(scan, { immediate: true })
   }
 
-  return NextResponse.json({ ok: true, customName: scan.customName, verifierEnabled: scan.verifierEnabled })
+  return NextResponse.json({ ok: true, customName: scan.customName, verifierEnabled: scan.verifierEnabled, autoMode: scan.autoMode })
 }
 

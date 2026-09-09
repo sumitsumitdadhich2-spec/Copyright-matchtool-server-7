@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users, ShieldCheck, ShieldX } from 'lucide-react'
+import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users, ShieldCheck, ShieldX, Zap, ZapOff } from 'lucide-react'
 import type { Scan, MinuteFinderMode } from '@/lib/types'
 import { fetcher } from '@/lib/format'
 import { useAuth } from '@/components/auth/auth-gate'
@@ -55,7 +55,11 @@ export function Dashboard() {
   })
 
   // Minute finder toggle (per-user setting): gemini (default) | twelvelabs | off.
-  const { data: settings, mutate: mutateSettings } = useSWR<{ minuteFinder?: MinuteFinderMode }>('/api/settings', fetcher)
+  const { data: settings, mutate: mutateSettings } = useSWR<{
+    minuteFinder?: MinuteFinderMode
+    autoMode?: boolean
+    verifierEnabled?: boolean
+  }>('/api/settings', fetcher)
   const minuteFinderMode: MinuteFinderMode = settings?.minuteFinder ?? 'gemini'
 
   const scan = data?.scan || null
@@ -85,29 +89,70 @@ export function Dashboard() {
   const stoppingInBackground = Boolean(running && status === 'stopped')
   const canStop = running && !stoppingInBackground
 
-  const verifierOn = scan?.verifierEnabled !== false
+  const verifierOn = scan ? scan.verifierEnabled !== false : settings?.verifierEnabled !== false
+  const autoModeOn = scan ? scan.autoMode !== false : settings?.autoMode !== false
 
   async function toggleVerifier() {
-    if (!scan) return
     const nextState = !verifierOn
-    void mutate({ ...data, scan: { ...scan, verifierEnabled: nextState } } as ScanResponse, false)
+    if (scan && data) {
+      void mutate({ ...data, scan: { ...scan, verifierEnabled: nextState } } as ScanResponse, false)
+    }
+    void mutateSettings((prev) => ({ ...(prev || {}), verifierEnabled: nextState }), false)
     try {
-      await Promise.all([
-        fetch(`/api/scans/${scan.id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ verifierEnabled: nextState }),
-        }),
+      const calls: Promise<unknown>[] = [
         fetch('/api/settings', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ verifierEnabled: nextState }),
         }),
-      ])
+      ]
+      if (scan) {
+        calls.push(
+          fetch(`/api/scans/${scan.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ verifierEnabled: nextState }),
+          }),
+        )
+      }
+      await Promise.all(calls)
     } catch {
       /* ignore and refresh below */
     } finally {
       void mutate()
+      void mutateSettings()
+    }
+  }
+
+  async function toggleAutoMode() {
+    const nextState = !autoModeOn
+    if (scan && data) {
+      void mutate({ ...data, scan: { ...scan, autoMode: nextState } } as ScanResponse, false)
+    }
+    void mutateSettings((prev) => ({ ...(prev || {}), autoMode: nextState }), false)
+    try {
+      const calls: Promise<unknown>[] = [
+        fetch('/api/settings', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ autoMode: nextState }),
+        }),
+      ]
+      if (scan) {
+        calls.push(
+          fetch(`/api/scans/${scan.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ autoMode: nextState }),
+          }),
+        )
+      }
+      await Promise.all(calls)
+    } catch {
+      /* ignore and refresh below */
+    } finally {
+      void mutate()
+      void mutateSettings()
     }
   }
 
@@ -187,38 +232,67 @@ export function Dashboard() {
               Stopping — partial results ready (export niche available)
             </span>
           )}
-          {scan && (
-            <button
-              type="button"
-              onClick={toggleVerifier}
-              disabled={busy}
-              className={`btn-press flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold transition-all shadow-sm ${
-                verifierOn
-                  ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 shadow-emerald-950/25'
-                  : 'border-zinc-700 bg-zinc-800/90 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+          <button
+            type="button"
+            onClick={toggleAutoMode}
+            disabled={busy}
+            className={`btn-press flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold transition-all shadow-sm ${
+              autoModeOn
+                ? 'border-cyan-500/60 bg-cyan-500/15 text-cyan-300 hover:bg-cyan-500/25 shadow-cyan-950/25'
+                : 'border-zinc-700 bg-zinc-800/90 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+            }`}
+            title={
+              autoModeOn
+                ? 'Auto Scan is ON: Full movie & short auto-accepted, scans start automatically upon upload without manual steps. Click to turn OFF.'
+                : 'Auto Scan is OFF: Manual movie trimming and minute selection enabled. Click to turn ON.'
+            }
+            aria-label={`Auto Scan is currently ${autoModeOn ? 'ON' : 'OFF'}. Click to toggle.`}
+          >
+            {autoModeOn ? (
+              <Zap className="size-4 text-cyan-400" aria-hidden />
+            ) : (
+              <ZapOff className="size-4 text-zinc-400" aria-hidden />
+            )}
+            <span className="font-medium">Auto:</span>
+            <span
+              className={`rounded px-1.5 py-0.5 text-xs font-black uppercase tracking-wider ${
+                autoModeOn ? 'bg-cyan-500 text-cyan-950' : 'bg-zinc-700 text-zinc-200'
               }`}
-              title={
-                verifierOn
-                  ? 'Verifier is ON (automatic 24fps AI check after chunks). Click to turn OFF.'
-                  : 'Verifier is OFF (no AI verify after chunks — instant raw matches). Click to turn ON.'
-              }
-              aria-label={`Verifier is currently ${verifierOn ? 'ON' : 'OFF'}. Click to toggle.`}
             >
-              {verifierOn ? (
-                <ShieldCheck className="size-4 text-emerald-400" aria-hidden />
-              ) : (
-                <ShieldX className="size-4 text-zinc-400" aria-hidden />
-              )}
-              <span className="font-medium">Verifier:</span>
-              <span
-                className={`rounded px-1.5 py-0.5 text-xs font-black uppercase tracking-wider ${
-                  verifierOn ? 'bg-emerald-500 text-emerald-950' : 'bg-zinc-700 text-zinc-200'
-                }`}
-              >
-                {verifierOn ? 'ON' : 'OFF'}
-              </span>
-            </button>
-          )}
+              {autoModeOn ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={toggleVerifier}
+            disabled={busy}
+            className={`btn-press flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold transition-all shadow-sm ${
+              verifierOn
+                ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 shadow-emerald-950/25'
+                : 'border-zinc-700 bg-zinc-800/90 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+            }`}
+            title={
+              verifierOn
+                ? 'Verifier is ON (automatic 24fps AI check after chunks). Click to turn OFF.'
+                : 'Verifier is OFF (no AI verify after chunks — instant raw matches). Click to turn ON.'
+            }
+            aria-label={`Verifier is currently ${verifierOn ? 'ON' : 'OFF'}. Click to toggle.`}
+          >
+            {verifierOn ? (
+              <ShieldCheck className="size-4 text-emerald-400" aria-hidden />
+            ) : (
+              <ShieldX className="size-4 text-zinc-400" aria-hidden />
+            )}
+            <span className="font-medium">Verifier:</span>
+            <span
+              className={`rounded px-1.5 py-0.5 text-xs font-black uppercase tracking-wider ${
+                verifierOn ? 'bg-emerald-500 text-emerald-950' : 'bg-zinc-700 text-zinc-200'
+              }`}
+            >
+              {verifierOn ? 'ON' : 'OFF'}
+            </span>
+          </button>
           <button
             type="button"
             onClick={() => action('start')}
@@ -308,10 +382,10 @@ export function Dashboard() {
             {/* Old TwelveLabs auto pipeline — only behind the toggle (zero changes inside). */}
             {scan && minuteFinderMode === 'twelvelabs' && <TwelveLabsPanel scan={scan} />}
             <UploadPanel scan={scan} selectedScanId={scanId} onScanCreated={(id) => setScanId(id)} refresh={() => void mutate()} />
-            {scan && scan.awaitingTrim && scan.movieDuration && scan.status !== 'chunking' && (
+            {scan && scan.awaitingTrim && !autoModeOn && scan.movieDuration && scan.status !== 'chunking' && (
               <TrimPanel scan={scan} refresh={() => void mutate()} />
             )}
-            {scan && (scan.shortSegments?.length ?? 0) > 1 && !scan.awaitingTrim && (
+            {scan && (scan.shortSegments?.length ?? 0) > 1 && !scan.awaitingTrim && !autoModeOn && (
               <MinuteSelectPanel scan={scan} running={running} refresh={() => void mutate()} />
             )}
             <ScanTimeline scan={scan || emptyScan()} />

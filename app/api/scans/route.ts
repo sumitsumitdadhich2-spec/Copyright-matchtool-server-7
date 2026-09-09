@@ -7,7 +7,7 @@ import { ensureBackgroundWorkers, stopBackgroundScan, MAX_BACKGROUND_SCANS_PER_U
 import { scheduler } from '@/lib/scheduler'
 import { isMinuteFinderRunning, stopGeminiMinuteFinder } from '@/lib/gemini-minute-finder'
 import { cancelRender } from '@/lib/render'
-import { getUserVerifierEnabled } from '@/lib/user-keys'
+import { getUserVerifierEnabled, getUserAutoMode } from '@/lib/user-keys'
 
 export const runtime = 'nodejs'
 
@@ -29,6 +29,7 @@ export async function POST() {
   if (session.username) {
     try {
       scan.verifierEnabled = await getUserVerifierEnabled(session.username)
+      scan.autoMode = await getUserAutoMode(session.username)
       saveScan(scan)
     } catch {}
   }

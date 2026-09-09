@@ -776,6 +776,8 @@ export interface Scan {
   candidateGroups?: CandidateGroup[]
   /** Verifier system toggle: true (default, auto-verify candidates at 24fps) | false (verifier off, skip verification) */
   verifierEnabled?: boolean
+  /** Auto mode toggle: true (default, auto full-short, full-movie, auto-start window minute finder) | false (manual choose/trim) */
+  autoMode?: boolean
   /** OPTIONAL Twelve Labs pre-filter: movie indexing state (absent = feature unused) */
   twelveLabs?: TwelveLabsState
   /** pre-filter decision of the LAST scan run (for the UI) */

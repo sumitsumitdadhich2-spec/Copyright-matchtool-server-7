@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getScan, saveScan, addLog, scanMediaDir, listScans } from './store'
 import type { Scan } from './types'
-import { probeDuration, chunkShort, cleanupSegments, chunkPath } from './ffmpeg'
+import { probeDuration, chunkShort, cleanupSegments, chunkPath, chunkMovie } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
 import { deleteEmbeddings } from './twelvelabs'
 import { copyObject, getFile, objectExists, putFile, storageEnabled } from './storage'
@@ -672,20 +672,83 @@ export async function finalizeUploadedMedia(
     scan.movieName = name
     scan.movieSize = size
     scan.movieDuration = duration
-    // Chunking WAITS for the trim confirmation — the user can select just the
-    // range that holds their scene (saves API quota) or confirm the full movie.
-    scan.chunkCount = 0
-    scan.chunks = []
-    scan.awaitingTrim = true
-    scan.movieTrimStart = undefined
-    scan.movieTrimEnd = undefined
-    scan.status = 'created'
-    scan.chunkingProgress = 0
-    addLog(
-      scan,
-      'info',
-      `Movie uploaded: ${name} (${fmtDur(duration)}) — select a trim range (optional) and confirm to start chunking`,
-    )
+    const isAuto = scan.autoMode !== false
+
+    if (isAuto) {
+      scan.awaitingTrim = false
+      scan.movieTrimStart = undefined
+      scan.movieTrimEnd = undefined
+      const count = Math.max(1, Math.ceil(duration / CHUNK_SECONDS))
+      scan.chunkCount = count
+      scan.chunks = Array.from({ length: count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
+      scan.status = 'chunking'
+      scan.chunkingProgress = 0
+      addLog(
+        scan,
+        'info',
+        `Movie uploaded: ${name} (${fmtDur(duration)}) — Auto mode ON: full movie auto-selected (${count} chunks), cutting in background`,
+      )
+      saveScan(scan, { immediate: true })
+
+      // Background chunking for full movie
+      const dest = localMediaPath(id, 'movie')
+      void (async () => {
+        try {
+          const reused = await findAndReuseMovieChunks(id, scan.movieName || '', scan.movieSize || 0, 0, duration, count)
+          if (reused.ok) {
+            const s = getScan(id)
+            if (s) {
+              s.chunkCount = reused.count
+              s.chunks = Array.from({ length: reused.count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
+              s.status = 'ready'
+              s.chunkingProgress = 100
+              addLog(s, 'success', `Reused ${reused.count} 1-min movie chunks from previous scan (no re-cutting needed)`)
+              saveScan(s)
+            }
+            return
+          }
+          const actual = await chunkMovie(dest, path.join(mediaDir, 'chunks'), duration, 0, duration, (pct) => {
+            const s = getScan(id)
+            if (s) {
+              s.chunkingProgress = pct
+              saveScan(s)
+            }
+          }, { owner: id })
+          const s = getScan(id)
+          if (s) {
+            s.chunkCount = actual
+            s.chunks = Array.from({ length: actual }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
+            s.status = 'ready'
+            s.chunkingProgress = 100
+            addLog(s, 'success', `Movie chunking complete: ${actual} 1-minute chunk(s) created`)
+            saveScan(s)
+          }
+        } catch (err) {
+          const s = getScan(id)
+          if (s) {
+            s.status = 'error'
+            s.error = `Chunking failed: ${err instanceof Error ? err.message : String(err)}`
+            addLog(s, 'error', s.error)
+            saveScan(s)
+          }
+        }
+      })()
+    } else {
+      // Chunking WAITS for the trim confirmation — the user can select just the
+      // range that holds their scene (saves API quota) or confirm the full movie.
+      scan.chunkCount = 0
+      scan.chunks = []
+      scan.awaitingTrim = true
+      scan.movieTrimStart = undefined
+      scan.movieTrimEnd = undefined
+      scan.status = 'created'
+      scan.chunkingProgress = 0
+      addLog(
+        scan,
+        'info',
+        `Movie uploaded: ${name} (${fmtDur(duration)}) — select a trim range (optional) and confirm to start chunking`,
+      )
+    }
   }
 
   saveScan(scan, { immediate: true })

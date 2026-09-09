@@ -226,12 +226,10 @@ async function reuseFromScan(req: Request, id: string, kind: MediaKind, name: st
 }
 
 /** Post-upload hooks shared by the stream path and the reuse path. */
-async function afterMediaReady(id: string, kind: MediaKind) {
-  // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
-  // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
-  // hisaab se Gemini Minute Finder / TwelveLabs pipeline / nothing.
-  // (Movie-after-short order trim route se trigger hota hai.)
-  if (kind !== 'short') return
+async function afterMediaReady(id: string, _kind: MediaKind) {
+  // AUTO MINUTE FINDER trigger: agar dono videos (short + movie) ready hain
+  // aur trim confirmed / auto-confirmed hai → user ke toggle ke hisaab se
+  // Gemini Minute Finder (Window mode) auto-start ho jayega.
   try {
     const fresh = getScan(id)
     if (fresh && pipelineReady(fresh)) {

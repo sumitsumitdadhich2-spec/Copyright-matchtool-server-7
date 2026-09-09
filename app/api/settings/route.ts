@@ -13,6 +13,8 @@ import {
   isMinuteFinderMode,
   getUserVerifierEnabled,
   setUserVerifierEnabled,
+  getUserAutoMode,
+  setUserAutoMode,
 } from '@/lib/user-keys'
 import { getSession } from '@/lib/users'
 import { MODEL_POOL } from '@/lib/models'
@@ -57,11 +59,14 @@ export async function GET() {
   const tlKey = await getUserTwelveLabsKey(session.username)
   const minuteFinder = await getUserMinuteFinderMode(session.username)
   const verifierEnabled = await getUserVerifierEnabled(session.username)
+  const autoMode = await getUserAutoMode(session.username)
   return NextResponse.json({
     keys,
     maxKeys: MAX_API_KEYS,
     // Verifier toggle: true (default) | false
     verifierEnabled,
+    // Auto scan toggle: true (default, full movie + full short + auto window scan) | false
+    autoMode,
     // Minute finder toggle: 'gemini' (default) | 'twelvelabs' | 'off'
     minuteFinder,
     // OPTIONAL Twelve Labs pre-filter key (missing = feature off, app unchanged)
@@ -81,11 +86,16 @@ export async function GET() {
   })
 }
 
-/** PUT { minuteFinder?: 'gemini' | 'twelvelabs' | 'off', verifierEnabled?: boolean } — persist settings. */
+/** PUT { minuteFinder?: 'gemini' | 'twelvelabs' | 'off', verifierEnabled?: boolean, autoMode?: boolean } — persist settings. */
 export async function PUT(req: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+  if (body.autoMode !== undefined) {
+    const enabled = Boolean(body.autoMode)
+    await setUserAutoMode(session.username, enabled)
+    return NextResponse.json({ ok: true, autoMode: enabled })
+  }
   if (body.verifierEnabled !== undefined) {
     const enabled = Boolean(body.verifierEnabled)
     await setUserVerifierEnabled(session.username, enabled)
@@ -96,6 +106,10 @@ export async function PUT(req: Request) {
   }
   await setUserMinuteFinderMode(session.username, body.minuteFinder)
   return NextResponse.json({ ok: true, minuteFinder: body.minuteFinder })
+}
+
+export async function PATCH(req: Request) {
+  return PUT(req)
 }
 
 export async function POST(req: Request) {

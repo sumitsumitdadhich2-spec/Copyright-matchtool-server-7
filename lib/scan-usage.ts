@@ -5,6 +5,7 @@ export interface ErrorCountDetails {
   notFound404: number // 404 model / clip not found (No tokens billed)
   invalidKey: number // Invalid / expired key (No tokens billed)
   dailyExhausted: number // Daily 25M token or 20 RPD cap reached
+  prohibitedPolicy: number // Prohibited content / Google safety filter blocked (Retried with sanitized audio/neutral prompt)
   other: number
 }
 
@@ -54,6 +55,7 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       notFound404: 0,
       invalidKey: 0,
       dailyExhausted: 0,
+      prohibitedPolicy: 0,
       other: 0,
     },
     byModel: {},
@@ -90,6 +92,7 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
           notFound404: 0,
           invalidKey: 0,
           dailyExhausted: 0,
+          prohibitedPolicy: 0,
           other: 0,
         },
       }
@@ -148,6 +151,15 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       let errorCategory: keyof ErrorCountDetails = 'highDemandOrRateLimit'
 
       if (
+        lower.includes('prohibited') ||
+        lower.includes('policy') ||
+        lower.includes('safety_ratings_blocked') ||
+        lower.includes('flagged by google policy') ||
+        lower.includes('prompt block reason')
+      ) {
+        isError = true
+        errorCategory = 'prohibitedPolicy'
+      } else if (
         lower.includes('rate limit') ||
         lower.includes('empty response') ||
         lower.includes('high demand') ||
