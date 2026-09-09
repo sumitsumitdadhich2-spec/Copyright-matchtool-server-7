@@ -5,7 +5,7 @@ import path from 'node:path'
 import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
-import { CHUNK_MODEL_POOL, RESCAN_BACKUP_POOL } from './models'
+import { CHUNK_MODEL_POOL, GAP_FINDER_AVAILABLE_MODELS } from './models'
 import { deleteFileQuiet, cleanupOrphanedGeminiFiles, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
@@ -119,7 +119,7 @@ export function gapBackupPreview(scan: Scan) {
   return { coverage: scanCoverage(scan), gaps: uncovered(scan), state }
 }
 
-export function startGapBackup(id: string, apiKeys: string[]) {
+export function startGapBackup(id: string, apiKeys: string[], selectedModels?: string[]) {
   if (active.has(id)) return { ok: false, error: 'Missing-scene finder already running' }
   const scan = getScan(id)
   if (!scan) return { ok: false, error: 'Scan not found' }
@@ -138,7 +138,7 @@ export function startGapBackup(id: string, apiKeys: string[]) {
   if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
   const control = { stopping: false }
   active.set(id, control)
-  void runGapBackup(scan, apiKeys, gaps, control).finally(() => active.delete(id))
+  void runGapBackup(scan, apiKeys, gaps, control, selectedModels).finally(() => active.delete(id))
   return { ok: true }
 }
 
@@ -157,7 +157,7 @@ async function ensureChunk(scan: Scan, movieFile: string, index: number) {
   return file
 }
 
-async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], control: { stopping: boolean }) {
+async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], control: { stopping: boolean }, selectedModels?: string[]) {
   const previous = scan.gapBackup
   const parts = buildParts(gaps)
   const minuteIndexes = [...new Set(parts.map((part) => part.minuteIndex))]
@@ -220,36 +220,38 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
     interface GapLane {
       key: string
       keyIndex: number
-      model: (typeof CHUNK_MODEL_POOL)[number] | (typeof RESCAN_BACKUP_POOL)[number]
+      model: (typeof GAP_FINDER_AVAILABLE_MODELS)[number]
       ai: ReturnType<typeof getClient>
       keyId: string
       cooldownUntil: number
       dead: boolean
     }
 
-    const allLanes: GapLane[] = apiKeys.flatMap((key, keyIndex) => [
-      ...CHUNK_MODEL_POOL.map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key), cooldownUntil: 0, dead: false })),
-      ...RESCAN_BACKUP_POOL.map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key), cooldownUntil: 0, dead: false })),
-    ])
+    const chosenModels = (selectedModels && selectedModels.length > 0)
+      ? GAP_FINDER_AVAILABLE_MODELS.filter((m) => selectedModels.includes(m.id))
+      : CHUNK_MODEL_POOL.map((m) => GAP_FINDER_AVAILABLE_MODELS.find((g) => g.id === m.id) || { id: m.id, name: m.id, rpd: m.rpd, rpm: m.rpm, description: '' })
 
-    const isPrimary = (lane: GapLane) => CHUNK_MODEL_POOL.some((m) => m.id === lane.model.id)
+    const allLanes: GapLane[] = apiKeys.flatMap((key, keyIndex) =>
+      chosenModels.map((model) => ({
+        key,
+        keyIndex,
+        model,
+        ai: getClient(key),
+        keyId: apiKeyHash(key),
+        cooldownUntil: 0,
+        dead: false,
+      }))
+    )
+
+    log(scan, 'info', `[Missing Scene Finder] Running with ${chosenModels.length} selected model(s): ${chosenModels.map((m) => m.name || m.id).join(', ')} across ${apiKeys.length} key(s)`)
+
     const pickLane = (): GapLane | null => {
       const now = Date.now()
-      // 1. Check if any primary models are available
-      const primaryLanes = allLanes.filter((l) => !l.dead && isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil <= now)
-      if (primaryLanes.length > 0) {
-        return primaryLanes[Math.floor(Math.random() * primaryLanes.length)]
-      }
-      // 2. Check if all primary models across all keys are exhausted
-      const anyPrimaryAlive = allLanes.some((l) => !l.dead && isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd)
-      if (!anyPrimaryAlive) {
-        // Fall back to backup lite pool
-        const backupLanes = allLanes.filter((l) => !l.dead && !isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil <= now)
-        if (backupLanes.length > 0) {
-          return backupLanes[Math.floor(Math.random() * backupLanes.length)]
-        }
-      }
-      return null
+      const available = allLanes.filter(
+        (l) => !l.dead && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil <= now
+      )
+      if (available.length === 0) return null
+      return available[Math.floor(Math.random() * available.length)]
     }
 
     const shortUploadPromises = new Map<string, Promise<{ uri: string; name: string }>>()
@@ -347,8 +349,6 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
             state.requestCount = (state.requestCount || 0) + 1
             persist(scan, state)
 
-            incrementModelUsage(lane.model.id, lane.key)
-
             const partList = parts.filter((part) => unresolved().includes(part.index))
             const specs = clipSpecs(partList)
             const response = await runGapFinderChunk(
@@ -360,6 +360,9 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               chunkStart,
               chunkEnd,
             )
+
+            // Increment usage ONLY after call succeeds
+            incrementModelUsage(lane.model.id, lane.key)
 
             const hits = parseGapFinderOutput(response.text, specs, chunkStart, chunkEnd)
             request.raw = response.text
@@ -413,7 +416,7 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               for (const l of allLanes) {
                 if (l.key === lane.key) {
                   l.dead = true
-                  for (const m of [...CHUNK_MODEL_POOL, ...RESCAN_BACKUP_POOL]) {
+                  for (const m of GAP_FINDER_AVAILABLE_MODELS) {
                     setModelExhausted(m.id, l.key, m.rpd)
                   }
                 }
@@ -424,11 +427,15 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
               lane.dead = true
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily token/request quota exhausted — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+            } else if (e.kind === 'empty') {
+              lane.cooldownUntil = Date.now() + 3_000
+              queue.push(item)
+              log(scan, 'warn', `Missing-scene finder: Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for alternative model`)
             } else if (e.kind === 'rate' || is503OrBusyError(err)) {
               lane.cooldownUntil = Date.now() + 5_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
+              log(scan, 'warn', `Missing-scene finder: Rate limit / High demand on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
             } else {
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts}/7 failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)

@@ -26,13 +26,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const { id } = await ctx.params
   const scan = await getFreshScan(id)
   if (!scan || !canAccess(session, scan)) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
-  const body = await req.json().catch(() => ({})) as { action?: string; candidateId?: string }
+  const body = await req.json().catch(() => ({})) as { action?: string; candidateId?: string; models?: string[] }
   if (body.action === 'stop') return NextResponse.json({ ok: stopGapBackup(id) })
   if ((body.action === 'accept' || body.action === 'reject') && body.candidateId) {
     const result = reviewGapCandidate(scan, body.candidateId, body.action)
     return NextResponse.json(result, { status: result.ok ? 200 : 404 })
   }
   const keys = await getAllUserApiKeys(session.username)
-  const result = startGapBackup(id, keys)
+  const result = startGapBackup(id, keys, Array.isArray(body.models) ? body.models : undefined)
   return NextResponse.json(result, { status: result.ok ? 200 : 409 })
 }

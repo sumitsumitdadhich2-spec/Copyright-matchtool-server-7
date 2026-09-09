@@ -44,6 +44,24 @@ export const RESCAN_BACKUP_POOL: ModelSpec[] = [
   { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
 ]
 
+export interface GapFinderModelOption {
+  id: string
+  name: string
+  rpd: number
+  rpm: number
+  description: string
+  recommended?: boolean
+}
+
+export const GAP_FINDER_AVAILABLE_MODELS: GapFinderModelOption[] = [
+  { id: 'gemini-3.7-flash', name: '3.7-shiva', rpd: 20, rpm: 5, description: 'Fast, balanced high-accuracy forensic', recommended: true },
+  { id: 'gemini-3.8-flash', name: '3.8-shiva', rpd: 20, rpm: 5, description: 'Deep forensic multi-frame analysis', recommended: true },
+  { id: 'gemini-3.6-flash', name: '3.6-shiva', rpd: 20, rpm: 5, description: 'Robust baseline scene comparison', recommended: true },
+  { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 20, rpm: 5, description: 'Precision chunk matcher', recommended: false },
+  { id: 'gemini-3.5-flash-lite', name: '3.5-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
+  { id: 'gemini-3.1-flash-lite', name: '3.1-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
+]
+
 /** Is this model one of the primary rescan models? */
 export function isRescanModel(id: string): boolean {
   return RESCAN_MODEL_POOL.some((m) => m.id === id)

@@ -17,7 +17,7 @@ const GEN_CONFIG = {
   ],
 } as const
 
-export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'other'
+export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'empty' | 'other'
 
 export class GeminiError extends Error {
   kind: GeminiErrorKind
@@ -170,8 +170,16 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('per day') ||
     lower.includes('perday') ||
     lower.includes('daily requests') ||
+    lower.includes('tokens_per_model_per_user') ||
+    lower.includes('requests_per_model_per_user') ||
+    lower.includes('generate_content_tokens_per_model') ||
+    lower.includes('generate_content_requests_per_model') ||
+    lower.includes('tokens_per_user') ||
+    lower.includes('requests_per_user') ||
+    lower.includes('_per_model_per_user') ||
     (lower.includes('daily') && lower.includes('quota')) ||
-    (lower.includes('limit: 20') && lower.includes('daily'))
+    (lower.includes('limit: 20') && lower.includes('daily')) ||
+    (lower.includes('limit: 25000000') || lower.includes('limit: 50000000') || lower.includes('limit: 100000000'))
 
   if (isExplicitDaily) {
     return new GeminiError('rpd', msg)
@@ -194,8 +202,8 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('rate', msg)
   }
 
-  if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder'))) {
-    return new GeminiError('rate', msg)
+  if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {
+    return new GeminiError('empty', msg)
   }
 
   return new GeminiError('other', msg)
@@ -900,11 +908,20 @@ export async function runGapFinderChunk(
       }],
       config: {
         ...GEN_CONFIG,
-        maxOutputTokens: 8192,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
       },
     })
     const text = extractResponseText(resp)
-    if (!text) throw new GeminiError('rate', 'Empty missing-scene finder response')
+    if (!text) {
+      const finishReason = (resp.candidates?.[0] as { finishReason?: string })?.finishReason
+      if (finishReason === 'SAFETY') {
+        throw new GeminiError('other', 'Missing-scene finder response blocked by safety filter')
+      }
+      if (finishReason === 'MAX_TOKENS') {
+        throw new GeminiError('empty', 'Missing-scene finder response hit MAX_TOKENS during output')
+      }
+      throw new GeminiError('empty', `Empty missing-scene finder response (finishReason=${finishReason || 'unknown'})`)
+    }
     return { text, tokens: resp.usageMetadata?.totalTokenCount ?? null }
   } catch (err) {
     throw classifyError(err)

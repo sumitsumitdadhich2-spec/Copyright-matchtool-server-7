@@ -5,7 +5,7 @@ import useSWR from 'swr'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Pause, Play, RotateCcw, Search, Square, X } from 'lucide-react'
 import type { GapBackupCandidate, GapBackupRequest, GapBackupState, Scan, ShortCoverage, ShortRange } from '@/lib/types'
 import { fetcher, fmtDuration, fmtTime } from '@/lib/format'
-import { displayModelName } from '@/lib/models'
+import { displayModelName, GAP_FINDER_AVAILABLE_MODELS } from '@/lib/models'
 
 interface GapResponse {
   coverage: ShortCoverage
@@ -189,6 +189,13 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
   const { data, mutate } = useSWR<GapResponse>(`/api/scans/${scan.id}/gap-backup`, fetcher, { refreshInterval: 1200 })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [showModelPicker, setShowModelPicker] = useState(false)
+  const [selectedModels, setSelectedModels] = useState<string[]>(() => [
+    'gemini-3.7-flash',
+    'gemini-3.8-flash',
+    'gemini-3.6-flash',
+  ])
+
   const preview = data ?? { coverage: scan.report?.coverage, gaps: [], state: scan.gapBackup, running: false }
   const coverage = preview.coverage
   const fallbackState: GapBackupState = { status: 'idle', parts: [], minutes: [], requests: [], candidates: [], addedMatches: [] }
@@ -200,14 +207,36 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
   const pending = state.candidates.filter((candidate) => candidate.review === 'pending')
   const groupedRequests = state.minutes.map((minute) => ({ minute, requests: state.requests.filter((request) => request.minuteIndex === minute.index) }))
 
+  const toggleModel = (id: string) => {
+    setSelectedModels((prev) =>
+      prev.includes(id) ? prev.filter((m) => m !== id) : [...prev, id]
+    )
+  }
+
+  const selectAllModels = () => {
+    setSelectedModels(GAP_FINDER_AVAILABLE_MODELS.map((m) => m.id))
+  }
+
+  const resetDefaultModels = () => {
+    setSelectedModels(['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash'])
+  }
+
   async function action(actionName: 'start' | 'stop' | 'accept' | 'reject', candidateId?: string) {
+    if (actionName === 'start' && selectedModels.length === 0) {
+      setError('Kam se kam 1 model choose karein')
+      return
+    }
     setBusy(true)
     setError(null)
     try {
       const response = await fetch(`/api/scans/${scan.id}/gap-backup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(actionName === 'start' ? {} : { action: actionName, candidateId }),
+        body: JSON.stringify(
+          actionName === 'start'
+            ? { action: 'start', models: selectedModels }
+            : { action: actionName, candidateId }
+        ),
       })
       const body = await response.json().catch(() => ({}))
       if (!response.ok) setError(body.error || 'Request complete nahi hui')
@@ -235,11 +264,82 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
         {coverage.gaps.map((gap) => <span key={`${gap.start}-${gap.end}`} className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1 font-mono text-xs text-warning">{fmtTime(gap.start)}–{fmtTime(gap.end)}</span>)}
       </div>
 
+      {/* MODEL SELECTION CONTROLS */}
+      {!running && (
+        <div className="mt-4 rounded-lg border border-border/80 bg-background/70 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-foreground">
+                Targeted AI Models ({selectedModels.length} selected):
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowModelPicker((prev) => !prev)}
+                className="text-[11px] font-medium text-primary hover:underline"
+              >
+                {showModelPicker ? 'Hide Options ▲' : 'Customize Models ▼'}
+              </button>
+            </div>
+            <div className="flex items-center gap-2 text-[11px]">
+              <button
+                type="button"
+                onClick={selectAllModels}
+                className="text-primary hover:underline"
+              >
+                Select All
+              </button>
+              <span className="text-muted-foreground">·</span>
+              <button
+                type="button"
+                onClick={resetDefaultModels}
+                className="text-muted-foreground hover:underline"
+              >
+                Reset Default (3.7, 3.8, 3.6)
+              </button>
+            </div>
+          </div>
+
+          <div className={`mt-2.5 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 ${showModelPicker ? 'block' : 'hidden sm:grid'}`}>
+            {GAP_FINDER_AVAILABLE_MODELS.map((model) => {
+              const isChecked = selectedModels.includes(model.id)
+              return (
+                <label
+                  key={model.id}
+                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-2 text-xs transition-colors ${
+                    isChecked
+                      ? 'border-primary/50 bg-primary/10 text-foreground'
+                      : 'border-border/60 bg-muted/30 text-muted-foreground hover:border-border'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    onChange={() => toggleModel(model.id)}
+                    className="mt-0.5 size-3.5 rounded-sm border-primary text-primary focus:ring-primary"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-foreground">{model.name}</span>
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        {model.rpm} RPM · {model.rpd} RPD
+                      </span>
+                    </div>
+                    <p className="mt-0.5 font-mono text-[10px] text-muted-foreground/90 truncate">
+                      {model.id}
+                    </p>
+                  </div>
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="mt-4 flex flex-wrap items-center gap-2">
         {!running ? (
-          <button type="button" onClick={() => void action('start')} disabled={busy || pending.length > 0} className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
+          <button type="button" onClick={() => void action('start')} disabled={busy || pending.length > 0 || selectedModels.length === 0} className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
             {busy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : state.status === 'idle' ? <Search className="size-3.5" aria-hidden /> : <RotateCcw className="size-3.5" aria-hidden />}
-            {state.status === 'idle' ? 'Find missing scenes' : 'Retry unresolved ranges'}
+            {state.status === 'idle' ? `Find missing scenes (${selectedModels.length} models)` : `Retry unresolved ranges (${selectedModels.length} models)`}
           </button>
         ) : (
           <button type="button" onClick={() => void action('stop')} disabled={busy} className="flex items-center gap-1.5 rounded-md border border-destructive/40 px-3 py-2 text-xs font-medium text-destructive"><Square className="size-3.5 fill-current" aria-hidden /> Stop finder</button>

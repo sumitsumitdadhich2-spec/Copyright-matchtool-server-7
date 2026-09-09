@@ -9,7 +9,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Clock,
   Loader2,
   Pause,
   Play,
@@ -560,7 +559,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           }))
           return
         }
-      } catch (err) {
+      } catch (_err) {
         if (attempt < 4) {
           appendLog(`⚠️ Attempt ${attempt}/4 network error. Scheduling automatic retry ${attempt + 1}/4...`, 'warn')
           continue
