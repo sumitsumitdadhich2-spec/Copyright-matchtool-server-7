@@ -115,13 +115,16 @@ function ChunkRow({ scan, chunk, segIdx }: { scan: Scan; chunk: ChunkState; segI
   const pendingVerify = (scan.candidateGroups || []).filter(
     (g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning',
   ).length
-  const isFailed = chunk.status === 'failed'
+  const isFailed = chunk.status === 'failed' || chunk.status === 'policy_blocked'
+  const isPolicyBlocked = chunk.status === 'policy_blocked'
   const canRetry = !scanning && chunk.status !== 'pending' && (isFailed || pendingVerify === 0)
-  const retryTitle = isFailed
-    ? 'Is failed chunk ko dobara queue me daal kar rescan karo'
-    : pendingVerify > 0
-      ? `Verification in progress — ${pendingVerify} candidate group(s) pending. Rescan tabhi milega jab saare candidates verify ho jayen.`
-      : 'Is chunk ko dobara chunk models se map karwao'
+  const retryTitle = isPolicyBlocked
+    ? 'Google Policy Blocked chunk — manual retry if needed'
+    : isFailed
+      ? 'Is failed chunk ko dobara queue me daal kar rescan karo'
+      : pendingVerify > 0
+        ? `Verification in progress — ${pendingVerify} candidate group(s) pending. Rescan tabhi milega jab saare candidates verify ho jayen.`
+        : 'Is chunk ko dobara chunk models se map karwao'
 
   async function retry() {
     if (retrying) return
@@ -152,6 +155,11 @@ function ChunkRow({ scan, chunk, segIdx }: { scan: Scan; chunk: ChunkState; segI
           <span className="text-[11px] text-muted-foreground">no matches in this minute</span>
         )}
         {chunk.status === 'failed' && <span className="text-[11px] text-destructive">failed</span>}
+        {chunk.status === 'policy_blocked' && (
+          <span className="rounded-full border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-500">
+            Flagged by Google Policy (PROHIBITED_CONTENT)
+          </span>
+        )}
         <div className="flex flex-wrap items-center gap-1.5">
           {matches.map((f, i) => (
             <span

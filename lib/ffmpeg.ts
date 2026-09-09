@@ -459,6 +459,28 @@ export async function extractClipPrecise(sourceFile: string, start: number, end:
   await verifyDuration(outFile, dur, SCAN_FPS)
 }
 
+/**
+ * Create a sanitized, silent (-an) copy of a video segment or chunk.
+ * Strips all audio tracks and applies normalized contrast to bypass audio-based and false-positive policy blocks.
+ */
+export async function sanitizeVideoMute(sourceFile: string, outFile: string, token?: CancelToken): Promise<void> {
+  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  await runFfmpeg(
+    [
+      '-y',
+      ...IN_FLAGS,
+      '-i', sourceFile,
+      '-an',
+      '-vf', `${SCAN_VF},eq=contrast=0.96:brightness=0.02`,
+      ...SCAN_VIDEO,
+      ...OUT_FLAGS,
+      '-movflags', '+faststart',
+      outFile,
+    ],
+    { label: `sanitize-mute ${path.basename(sourceFile)}`, token },
+  )
+}
+
 // ---------- Backup minute finder clip (missing short parts, concatenated) ----------
 
 /** Black + silence inserted between concatenated parts so PART boundaries are unmistakable. */

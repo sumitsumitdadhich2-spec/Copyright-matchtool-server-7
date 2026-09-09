@@ -1,4 +1,4 @@
-export type ChunkStatus = 'pending' | 'scanning' | 'no_match' | 'match' | 'failed' | 'cancelled'
+export type ChunkStatus = 'pending' | 'scanning' | 'no_match' | 'match' | 'failed' | 'cancelled' | 'policy_blocked'
 
 /** PROVENANCE — where a match / candidate group came from:
  *  'chunk'      = normal chunk-mapping pass (short minute vs movie chunk)
@@ -63,6 +63,8 @@ export interface ChunkState {
   matches?: ChunkMatch[]
   /** automatic quality retries used (false-result detector) — max 1 */
   qualityRetries?: number
+  /** whether this chunk had an automatic audio-stripped sanitized retry after a policy block */
+  policyRetried?: boolean
   /** full raw Gemini outputs produced for this chunk, oldest first */
   rawOutputs?: ChunkRawOutput[]
   /** cancelled by the EARLY-STOP system (all matches found + fast-confirmed) —

@@ -10,7 +10,8 @@ const STATUS_CLASS: Record<string, string> = {
   scanning: 'bg-primary animate-pulse',
   no_match: 'bg-success/70',
   match: 'bg-destructive',
-  failed: 'bg-amber-500/80',
+  failed: 'bg-destructive/80',
+  policy_blocked: 'bg-amber-500',
   cancelled: 'bg-muted/50',
 }
 

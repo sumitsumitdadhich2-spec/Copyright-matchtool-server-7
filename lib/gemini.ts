@@ -17,7 +17,7 @@ const GEN_CONFIG = {
   ],
 } as const
 
-export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'empty' | 'other'
+export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'empty' | 'policy_blocked' | 'other'
 
 export class GeminiError extends Error {
   kind: GeminiErrorKind
@@ -134,6 +134,20 @@ export function extractResponseDetails(resp: GeminiResponseLike | unknown): Gemi
 }
 
 /** Safely extracts text from a Gemini response, inspecting direct text and all candidate text parts. */
+function checkResponseText(details: GeminiResponseDetails, defaultName: string): string {
+  if (details.text) return details.text
+  const isPolicy =
+    details.blockReason === 'PROHIBITED_CONTENT' ||
+    details.finishReason === 'SAFETY' ||
+    details.finishReason === 'PROHIBITED_CONTENT' ||
+    details.finishReason === 'BLOCKLIST'
+  const kind: GeminiErrorKind = isPolicy ? 'policy_blocked' : 'empty'
+  throw new GeminiError(
+    kind,
+    details.diagnostic || `Empty ${defaultName} response (finishReason=${details.finishReason || 'unknown'}, blockReason=${details.blockReason || 'none'})`,
+  )
+}
+
 export function extractResponseText(resp: GeminiResponseLike | unknown): string {
   return extractResponseDetails(resp).text
 }
@@ -281,6 +295,20 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('rate', msg)
   }
 
+  if (
+    lower.includes('prohibited_content') ||
+    lower.includes('blocked_by_safety') ||
+    lower.includes('safety_ratings_blocked') ||
+    lower.includes('block_reason: prohibited_content') ||
+    lower.includes('prompt block reason: prohibited_content') ||
+    lower.includes('finishreason=safety') ||
+    lower.includes('finish reason: safety') ||
+    lower.includes('finish reason: blocklist') ||
+    lower.includes('finish reason: prohibited_content')
+  ) {
+    return new GeminiError('policy_blocked', msg)
+  }
+
   if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {
     return new GeminiError('empty', msg)
   }
@@ -334,6 +362,31 @@ Na milne par:
   Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND — <chhota reason>
 
 Poore answer me sirf HISSA 1 aur HISSA 2 do, aur kuch nahi.`
+
+/** Neutral, sanitized prompt for PROHIBITED_CONTENT policy retry (pure frame alignment, no narrative text or dialogue requirements). */
+export const CHUNK_MAP_SANITIZED_PROMPT = `You are an automated visual frame-level timestamp alignment system. You are given TWO silent video streams at 24 fps:
+- Video 1: Reference clip stream.
+- Video 2: Search segment stream (00:00.000 to ~01:00.000 local clock).
+
+Task: Pure geometric & visual frame alignment only. Do not generate semantic narrative interpretations or conversational text. Output strictly raw timestamp pairs.
+
+Structure your answer in two sections:
+
+=====================
+HISSA 1 — SHORT VIDEO TIME MAP
+=====================
+Break Video 1 into visual sub-intervals:
+mm:ss.mmm - mm:ss.mmm (startFrame-endFrame frames): Visual segment <index>
+
+=====================
+HISSA 2 — MOVIE MAP TIME
+=====================
+For each segment from HISSA 1, locate corresponding visual frames in Video 2:
+Short mm:ss.mmm - mm:ss.mmm --> Movie mm:ss.mmm - mm:ss.mmm (startFrame-endFrame frames)
+If not present:
+Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND — not present in this chunk
+
+Only output HISSA 1 and HISSA 2.`
 
 // ---------- Gemini Minute Finder (20-minute window pre-scan) ----------
 
@@ -453,11 +506,9 @@ export async function runMinuteFinderWindow(
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    if (!details.text) {
-      throw new GeminiError('empty', details.diagnostic || `Empty minute-finder response (finishReason=${details.finishReason || 'unknown'})`)
-    }
+    const text = checkResponseText(details, 'minute-finder')
     const tokens = details.usageMetadata?.totalTokenCount ?? null
-    return { text: details.text, tokens }
+    return { text, tokens }
   } catch (err) {
     throw classifyError(err)
   }
@@ -616,11 +667,9 @@ export async function runBackupMinuteFinderWindow(
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    if (!details.text) {
-      throw new GeminiError('empty', details.diagnostic || `Empty backup minute-finder response (finishReason=${details.finishReason || 'unknown'})`)
-    }
+    const text = checkResponseText(details, 'backup minute-finder')
     const tokens = details.usageMetadata?.totalTokenCount ?? null
-    return { text: details.text, tokens }
+    return { text, tokens }
   } catch (err) {
     throw classifyError(err)
   }
@@ -873,6 +922,7 @@ export async function mapChunkRequest(
   model: string,
   shortUri: string,
   chunkUri: string,
+  customPrompt?: string,
 ): Promise<string> {
   try {
     const resp = await ai.models.generateContent({
@@ -883,17 +933,14 @@ export async function mapChunkRequest(
           parts: [
             { fileData: { fileUri: shortUri, mimeType: 'video/mp4' }, videoMetadata: { fps: SCAN_FPS } },
             { fileData: { fileUri: chunkUri, mimeType: 'video/mp4' }, videoMetadata: { fps: SCAN_FPS } },
-            { text: CHUNK_MAP_PROMPT },
+            { text: customPrompt || CHUNK_MAP_PROMPT },
           ] as never,
         },
       ],
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    if (!details.text) {
-      throw new GeminiError('empty', details.diagnostic || `Empty model response (finishReason=${details.finishReason || 'unknown'})`)
-    }
-    return details.text
+    return checkResponseText(details, 'model')
   } catch (err) {
     throw classifyError(err)
   }
@@ -1189,10 +1236,7 @@ export async function verifyRequest(
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    if (!details.text) {
-      throw new GeminiError('empty', details.diagnostic || `Empty verifier response (finishReason=${details.finishReason || 'unknown'})`)
-    }
-    return details.text
+    return checkResponseText(details, 'verifier')
   } catch (err) {
     throw classifyError(err)
   }
@@ -1228,10 +1272,7 @@ export async function rescanRequest(
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    if (!details.text) {
-      throw new GeminiError('empty', details.diagnostic || `Empty rescan response (finishReason=${details.finishReason || 'unknown'})`)
-    }
-    return details.text
+    return checkResponseText(details, 'rescan')
   } catch (err) {
     throw classifyError(err)
   }

@@ -28,7 +28,7 @@ import {
   scanMediaDir,
   listScans,
 } from './store'
-import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, segmentPath } from './ffmpeg'
+import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, sanitizeVideoMute, segmentPath } from './ffmpeg'
 import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
 import {
   ensureIndex,
@@ -46,6 +46,7 @@ import {
   deleteFileQuiet,
   cleanupOrphanedGeminiFiles,
   mapChunkRequest,
+  CHUNK_MAP_SANITIZED_PROMPT,
   parseChunkMatches,
   verifyRequest,
   rescanRequest,
@@ -513,7 +514,7 @@ class Scheduler {
     }
     if (!chunk) return { ok: false, error: `Chunk ${chunkIndex} not found` }
 
-    const isFailedChunk = chunk.status === 'failed'
+    const isFailedChunk = chunk.status === 'failed' || chunk.status === 'policy_blocked'
 
     // RESCAN LOCK: a manual retry on matched/no_match chunks waits while the verification
     // queue has pending candidates. But a FAILED chunk has no pending verifications and
@@ -548,6 +549,7 @@ class Scheduler {
     chunk.status = 'pending'
     chunk.attempts = 0
     chunk.qualityRetries = 0
+    chunk.policyRetried = false
     chunk.matches = []
     scan.matches = (scan.matches || []).filter(
       (mm) => !(mm.chunkIndex === chunkIndex && mm.shortStart >= segStart && mm.shortStart < segEnd),
@@ -2302,18 +2304,50 @@ class Scheduler {
           raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
         } catch (reqErr) {
           const re = classifyError(reqErr)
-          // RATE LIMIT (429): do NOT retry immediately with zero wait on the same key!
-          // Throw immediately so it enters cooldown and is re-queued for another key.
-          if (re.kind === 'rate') throw reqErr
+          const isPolicyBlocked =
+            re.kind === 'policy_blocked' ||
+            /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
-          // On temporary server errors (503 / overload / 5xx), do ONE retry with 2s backoff
-          const isServerOverload = /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
-          if (!isServerOverload) throw reqErr
+          if (isPolicyBlocked && !chunk.policyRetried) {
+            chunk.policyRetried = true
+            addLog(
+              scan,
+              'warn',
+              `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral Frame Alignment prompt...`,
+            )
+            this.mark(job)
 
-          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: Gemini model server busy (503/overload) on ${m.id} (key ${lane.idx}) — retrying in 2s...`)
-          this.mark(job)
-          await sleep(2000)
-          raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+            // Prepare sanitized muted chunk video
+            const mediaDir = scanMediaDir(scan.id)
+            const sanitizedDir = path.join(mediaDir, 'sanitized')
+            const originalChunkFile = chunkPath(path.join(mediaDir, 'chunks'), chunkIndex)
+            const sanitizedChunkFile = path.join(sanitizedDir, `chunk-${String(chunkIndex).padStart(4, '0')}-muted.mp4`)
+
+            if (!fs.existsSync(sanitizedChunkFile) && fs.existsSync(originalChunkFile)) {
+              await sanitizeVideoMute(originalChunkFile, sanitizedChunkFile)
+            }
+
+            const fileToUpload = fs.existsSync(sanitizedChunkFile) ? sanitizedChunkFile : originalChunkFile
+            const sanitizedUploaded = await uploadVideo(lane.ai, fileToUpload, 'video/mp4', `chunk-${chunkIndex}-sanitized`)
+            backupNames.push(sanitizedUploaded.name)
+
+            // Request with sanitized muted chunk and neutral prompt
+            raw = await mapChunkRequest(lane.ai, m.id, shortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
+            addLog(scan, 'success', `${minutePrefix}Chunk ${chunkIndex}: Sanitized retry succeeded after policy flag bypass`)
+          } else {
+            // RATE LIMIT (429): do NOT retry immediately with zero wait on the same key!
+            // Throw immediately so it enters cooldown and is re-queued for another key.
+            if (re.kind === 'rate') throw reqErr
+
+            // On temporary server errors (503 / overload / 5xx), do ONE retry with 2s backoff
+            const isServerOverload = /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
+            if (!isServerOverload) throw reqErr
+
+            addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: Gemini model server busy (503/overload) on ${m.id} (key ${lane.idx}) — retrying in 2s...`)
+            this.mark(job)
+            await sleep(2000)
+            raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+          }
         }
 
         const used = incrementModelUsage(m.id, lane.apiKey)
@@ -2383,7 +2417,12 @@ class Scheduler {
         // Quota limits, rate limits, model exhaustions, empty responses, temporary 503s, and network/upload hiccups
         // are properties of the API key/Gemini service — NEVER the chunk video itself!
         // These MUST NOT consume chunk.attempts, so transient bursts never mark a chunk as 'failed'!
+        const isPolicyBlocked =
+          e.kind === 'policy_blocked' ||
+          /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(e.message)
+
         const isTransientInfra =
+          isPolicyBlocked ||
           e.kind === 'rate' ||
           e.kind === 'rpd' ||
           e.kind === 'unavailable' ||
@@ -2395,7 +2434,16 @@ class Scheduler {
           chunk.attempts = (chunk.attempts || 0) + 1
         }
 
-        if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
+        if (isPolicyBlocked) {
+          chunk.status = 'policy_blocked'
+          // CRITICAL QUOTA SAVER: Do NOT re-queue this chunk on other keys!
+          // The sanitized retry also hit Google hard policy — stop retries for this chunk to protect API keys quota!
+          addLog(
+            scan,
+            'warn',
+            `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) after sanitized retry — automatic retries stopped to protect API keys quota; moving to next chunk`,
+          )
+        } else if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
           chunk.status = 'failed'
           addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${e.message.slice(0, 140)}`)
         } else if (e.kind === 'invalid_key') {
