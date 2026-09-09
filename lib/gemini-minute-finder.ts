@@ -460,19 +460,42 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const pending = ctrl.queue.length
 
   // ---- [2] Uploads: short + movie copy ----
-  // We only need enough keys to provide lanes for the windows (each key has 3 model lanes).
-  // E.g., for 5 windows, 2 keys (6 lanes) are sufficient to scan all windows in parallel.
-  // We prioritize keys with existing cached uploads first so upload time is 0s whenever possible.
-  const allKeys = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
-  const maxKeysForPrescan = Math.min(allKeys.length, Math.max(2, Math.min(3, Math.ceil(total / 2))))
-
-  // Sort keys: cached active uploads first, then remaining keys
-  const sortedKeys = [...allKeys].sort((a, b) => {
-    const aCached = ctrl.state.uploads[a.keyId] ? 1 : 0
-    const bCached = ctrl.state.uploads[b.keyId] ? 1 : 0
-    return bCached - aCached
+  // QUOTA-AWARE KEY SELECTION: Pehle har key ki daily model quota check karo.
+  // Jin keys ke paas chunk models (3.6/3.7/3.8) me quota available hai, unhe select karo.
+  // Jin keys par quota exhausted ho chuki hai, unhe skip karo taaki unpar time/upload waste na ho.
+  const allKeysWithQuota = apiKeys.map((k, i) => {
+    const keyId = apiKeyHash(k)
+    const availableLanes = CHUNK_MODEL_POOL.filter((m) => getModelUsage(m.id, k) < m.rpd)
+    const totalRemaining = CHUNK_MODEL_POOL.reduce((sum, m) => sum + Math.max(0, m.rpd - getModelUsage(m.id, k)), 0)
+    const hasCachedUploads = Boolean(ctrl.state.uploads[keyId]?.movieCopy && ctrl.state.uploads[keyId]?.short)
+    return {
+      keyIdx: i + 1,
+      apiKey: k,
+      keyId,
+      ai: getClient(k),
+      availableLanesCount: availableLanes.length,
+      totalRemaining,
+      hasCachedUploads,
+    }
   })
-  const selectedKeys = sortedKeys.slice(0, maxKeysForPrescan)
+
+  // Sort keys:
+  // 1. Keys with remaining quota (totalRemaining > 0) strictly FIRST.
+  // 2. Among keys with quota: keys with cached uploads first (0s upload wait), then higher remaining quota.
+  // 3. Exhausted keys (0 remaining) at the bottom.
+  const sortedKeys = [...allKeysWithQuota].sort((a, b) => {
+    if ((a.totalRemaining > 0) !== (b.totalRemaining > 0)) {
+      return a.totalRemaining > 0 ? -1 : 1
+    }
+    if (a.hasCachedUploads !== b.hasCachedUploads) {
+      return a.hasCachedUploads ? -1 : 1
+    }
+    return b.totalRemaining - a.totalRemaining
+  })
+
+  // Pick keys that actually have remaining quota (fallback to all keys if all appear exhausted)
+  const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
+  const selectedKeys = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${selectedKeys.length} keys)...` })
   let uploadedKeys = 0
