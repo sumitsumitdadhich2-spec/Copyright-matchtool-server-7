@@ -164,6 +164,17 @@ export function incrementModelUsage(model: string, apiKey: string): number {
   return counters[key]
 }
 
+export function decrementModelUsage(model: string, apiKey: string): number {
+  checkDailyReset()
+  const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
+  const key = counterKey(model, apiKey)
+  if (counters[key] && counters[key] > 0) {
+    counters[key] -= 1
+  }
+  writeJSON(COUNTERS_FILE, counters)
+  return counters[key] || 0
+}
+
 export function setModelExhausted(model: string, apiKey: string, rpd: number) {
   checkDailyReset()
   // Force the counter to the daily cap so it is treated as exhausted everywhere.

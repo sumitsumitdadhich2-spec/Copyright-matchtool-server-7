@@ -841,7 +841,6 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       }
 
       ctrl.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
-      incrementModelUsage(lane.model.id, lane.apiKey)
       w.attempts = (w.attempts || 0) + 1
       const clipFps = ctrl.state.backup?.clip?.fps
       log(
@@ -851,6 +850,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       )
 
       const { text, tokens, parsed } = await sendWindow(ctrl, lane, w, pass)
+      incrementModelUsage(lane.model.id, lane.apiKey)
 
       // Parse sanity: no hits AND no recognizable HISSA 3 / NOT FOUND => retry.
       const recognizable =

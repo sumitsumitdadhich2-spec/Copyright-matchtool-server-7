@@ -133,15 +133,17 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     }
   }
 
-  const loggedRequests = new Set<string>()
+  const loggedErrors = new Set<string>()
+  const loggedEffective = new Set<string>()
 
   // 1. Parse Scan Logs with precise error vs effective request differentiation
   if (Array.isArray(scan.logs)) {
     for (const entry of scan.logs) {
       const msg = entry.msg || ''
       const lower = msg.toLowerCase()
+      const timeKey = entry.t || (entry as { time?: number }).time || msg
 
-      // Determine Error Type if this log represents a failure/retry
+      // Check if this log represents an Error / Retry attempt
       let isError = false
       let errorCategory: keyof ErrorCountDetails = 'highDemandOrRateLimit'
 
@@ -154,12 +156,13 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         lower.includes('re-queued') ||
         lower.includes('overloaded') ||
         lower.includes('cooldown') ||
+        lower.includes('api busy') ||
         lower.includes('failed on') ||
         (lower.includes('attempt') && lower.includes('failed'))
       ) {
         isError = true
         errorCategory = 'highDemandOrRateLimit'
-      } else if (lower.includes('404') || lower.includes('not found') || lower.includes('unavailable')) {
+      } else if (lower.includes('404') || lower.includes('unavailable')) {
         isError = true
         errorCategory = 'notFound404'
       } else if (lower.includes('invalid/expired') || lower.includes('invalid api key')) {
@@ -170,94 +173,134 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         errorCategory = 'dailyExhausted'
       }
 
-      // Chunk mapping logs
-      const chunkMatch = msg.match(/(?:Chunk\s+(\d+).*?on|mapping short.*on|Rate limit on)\s+(gemini-[\w.-]+)/i)
-      if (
-        chunkMatch &&
-        !lower.includes('rescan') &&
-        !lower.includes('verifier') &&
-        !lower.includes('missing-scene')
-      ) {
-        const model = chunkMatch[2] || chunkMatch[1]
-        const rawModel = normalizeModelName(model)
-        const key = `chunk-${entry.t || (entry as { time?: number }).time || msg}-${rawModel}-${isError ? 'err' : 'ok'}`
-        if (!loggedRequests.has(key)) {
-          loggedRequests.add(key)
-          recordRequest(rawModel, 'chunkScan', !isError, isError ? errorCategory : undefined)
+      if (isError) {
+        const modelMatch = msg.match(/(gemini-[\w.-]+)/i)
+        if (modelMatch) {
+          const rawModel = normalizeModelName(modelMatch[1])
+          let stage: keyof ScanUsageSummary['byStage'] = 'chunkScan'
+          if (lower.includes('rescan')) stage = 'rescan'
+          else if (lower.includes('verifier') || lower.includes('verify')) stage = 'verifier'
+          else if (lower.includes('missing-scene') || lower.includes('missing scene')) stage = 'missingScene'
+          else if (lower.includes('window') || lower.includes('minute finder')) stage = 'minuteFinder'
+
+          const key = `err-${timeKey}-${rawModel}-${msg.slice(0, 40)}`
+          if (!loggedErrors.has(key)) {
+            loggedErrors.add(key)
+            recordRequest(rawModel, stage, false, errorCategory)
+          }
+        }
+        continue
+      }
+
+      // Check for Completed / Successful Work (Effective Requests)
+      // 1a. Chunk mapping completion
+      const chunkMatch = msg.match(/Chunk\s+(\d+).*?on\s+(gemini-[\w.-]+)/i)
+      if (chunkMatch && (lower.includes('matched') || lower.includes('found') || lower.includes('no segments'))) {
+        const rawModel = normalizeModelName(chunkMatch[2])
+        const key = `chunk-eff-${timeKey}-${chunkMatch[1]}-${rawModel}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
+          recordRequest(rawModel, 'chunkScan', true)
         }
       }
 
-      // Rescan logs
-      const rescanMatch = msg.match(/rescan(?:ned|ning)?.*?on\s+(gemini-[\w.-]+)|\((gemini-[\w.-]+).*?rescan\)/i)
-      if (rescanMatch) {
-        const model = rescanMatch[1] || rescanMatch[2]
-        const rawModel = normalizeModelName(model)
-        const key = `rescan-${entry.t || (entry as { time?: number }).time || msg}-${rawModel}-${isError ? 'err' : 'ok'}`
-        if (!loggedRequests.has(key)) {
-          loggedRequests.add(key)
-          recordRequest(rawModel, 'rescan', !isError, isError ? errorCategory : undefined)
+      // 1b. Rescan completion
+      const rescanMatch = msg.match(/rescan.*?on\s+(gemini-[\w.-]+)/i)
+      if (rescanMatch && (lower.includes('found') || lower.includes('hunt') || lower.includes('re-verify'))) {
+        const rawModel = normalizeModelName(rescanMatch[1])
+        const key = `rescan-eff-${timeKey}-${rawModel}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
+          recordRequest(rawModel, 'rescan', true)
         }
       }
 
-      // Verifier logs
-      const verifierMatch = msg.match(/(?:Verifier|Batch Verifier).*?on\s+(gemini-[\w.-]+)/i)
+      // 1c. Verifier completion
+      const verifierMatch = msg.match(/(?:verifier|confirmed|different).*?(?:on|verifier:)\s*(gemini-[\w.-]+)/i)
       if (verifierMatch) {
-        const model = verifierMatch[1]
-        const rawModel = normalizeModelName(model)
-        const key = `verifier-${entry.t || (entry as { time?: number }).time || msg}-${rawModel}-${isError ? 'err' : 'ok'}`
-        if (!loggedRequests.has(key)) {
-          loggedRequests.add(key)
-          recordRequest(rawModel, 'verifier', !isError, isError ? errorCategory : undefined)
+        const rawModel = normalizeModelName(verifierMatch[1])
+        const key = `verifier-eff-${timeKey}-${rawModel}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
+          recordRequest(rawModel, 'verifier', true)
         }
       }
 
-      // Missing-scene logs
-      const missingMatch = msg.match(/Missing-scene.*?on\s+(gemini-[\w.-]+)/i)
-      if (missingMatch) {
-        const model = missingMatch[1]
-        const rawModel = normalizeModelName(model)
-        const key = `missing-${entry.t || (entry as { time?: number }).time || msg}-${rawModel}-${isError ? 'err' : 'ok'}`
-        if (!loggedRequests.has(key)) {
-          loggedRequests.add(key)
-          recordRequest(rawModel, 'missingScene', !isError, isError ? errorCategory : undefined)
+      // 1d. Missing scene finder completion
+      const missingMatch = msg.match(/missing-scene.*?on\s+(gemini-[\w.-]+)/i)
+      if (missingMatch && (lower.includes('candidate') || lower.includes('found') || lower.includes('done'))) {
+        const rawModel = normalizeModelName(missingMatch[1])
+        const key = `missing-eff-${timeKey}-${rawModel}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
+          recordRequest(rawModel, 'missingScene', true)
         }
       }
 
-      // Minute Finder Window logs
-      const windowMatch = msg.match(/(?:Window|pass window|Minute finder).*?on\s+(gemini-[\w.-]+)/i)
-      if (windowMatch) {
-        const model = windowMatch[1]
-        const rawModel = normalizeModelName(model)
-        const key = `window-${entry.t || (entry as { time?: number }).time || msg}-${rawModel}-${isError ? 'err' : 'ok'}`
-        if (!loggedRequests.has(key)) {
-          loggedRequests.add(key)
-          recordRequest(rawModel, 'minuteFinder', !isError, isError ? errorCategory : undefined)
+      // 1e. Minute finder window completion
+      const windowMatch = msg.match(/(?:window|minute finder).*?on\s+(gemini-[\w.-]+)/i)
+      if (windowMatch && (lower.includes('hit') || lower.includes('done') || lower.includes('completed'))) {
+        const rawModel = normalizeModelName(windowMatch[1])
+        const key = `window-eff-${timeKey}-${rawModel}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
+          recordRequest(rawModel, 'minuteFinder', true)
         }
       }
     }
   }
 
-  // 2. Structural fallback if logs are empty/truncated
-  if (scan.geminiPrescan) {
-    if (Array.isArray(scan.geminiPrescan.windows)) {
-      for (const w of scan.geminiPrescan.windows) {
+  // 2. Structural sync from scan data objects (guarantees accurate counts even with sparse logs)
+  if (scan.geminiPrescan?.windows && Array.isArray(scan.geminiPrescan.windows)) {
+    const prescanDone = scan.geminiPrescan.windows.filter((w) => w.status === 'done' || w.hits !== undefined)
+    if (summary.byStage.minuteFinder < prescanDone.length) {
+      for (const w of prescanDone) {
         const laneModel = w.lane?.split('·')[1]?.trim()
         const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
-        if (summary.byStage.minuteFinder === 0) {
+        const key = `struct-win-${w.index}-${model}`
+        if (!loggedEffective.has(key)) {
+          loggedEffective.add(key)
           recordRequest(model, 'minuteFinder', true)
         }
       }
     }
   }
 
-  if (summary.byStage.chunkScan === 0) {
-    const segments = scan.shortSegments || []
-    const chunks = segments.flatMap((s) => s.chunks || [])
-    const chunkList = chunks.length > 0 ? chunks : scan.chunks || []
-    for (const c of chunkList) {
-      if (c && (c.status === 'match' || c.status === 'no_match')) {
-        const model = normalizeModelName(c.model || 'gemini-3.7-flash')
+  const segments = scan.shortSegments || []
+  const chunks = segments.flatMap((s) => s.chunks || [])
+  const chunkList = chunks.length > 0 ? chunks : scan.chunks || []
+  const completedChunks = chunkList.filter((c) => c && (c.status === 'match' || c.status === 'no_match'))
+
+  if (summary.byStage.chunkScan < completedChunks.length) {
+    for (const c of completedChunks) {
+      const model = normalizeModelName(c.model || 'gemini-3.7-flash')
+      const key = `struct-chunk-${c.index}-${model}`
+      if (!loggedEffective.has(key)) {
+        loggedEffective.add(key)
         recordRequest(model, 'chunkScan', true)
+      }
+    }
+  }
+
+  if (scan.candidateGroups && Array.isArray(scan.candidateGroups)) {
+    for (const g of scan.candidateGroups) {
+      for (const c of g.candidates || []) {
+        if (c.verdict === 'same' || c.verdict === 'different') {
+          const model = normalizeModelName(c.verifierModel || 'gemini-3.5-flash-lite')
+          const key = `struct-verif-${g.id}-${c.chunkIndex}-${model}`
+          if (!loggedEffective.has(key)) {
+            loggedEffective.add(key)
+            recordRequest(model, 'verifier', true)
+          }
+        }
+        if (c.rescan === 'found' || c.rescan === 'not_found') {
+          const model = normalizeModelName(c.rescanModel || 'gemini-3-flash-preview')
+          const key = `struct-rescan-${g.id}-${c.chunkIndex}-${model}`
+          if (!loggedEffective.has(key)) {
+            loggedEffective.add(key)
+            recordRequest(model, 'rescan', true)
+          }
+        }
       }
     }
   }

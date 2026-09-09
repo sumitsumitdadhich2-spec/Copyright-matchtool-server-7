@@ -61,8 +61,8 @@ import { globalGeminiCoordinator } from './global-gemini-coordinator'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Max attempts per chunk before it is marked failed (capped strictly at 7 to prevent infinite retry loops). */
-const MAX_CHUNK_ATTEMPTS = 7
+/** Max attempts per chunk before it is marked failed (capped strictly at 4 to protect API quota). */
+const MAX_CHUNK_ATTEMPTS = 4
 
 /** One API key lane (1-20). Gemini Files API uploads are PER KEY,
  *  so each lane keeps its own uploaded short-SEGMENT URIs (one per minute). */
@@ -631,22 +631,44 @@ class Scheduler {
     return s
   }
 
+  /** Per-segment cut locks so concurrent lanes never cut the SAME segment file simultaneously. */
+  private segCutLocks = new Map<string, Promise<string>>()
+
+  /** Ensure the short-minute segment file exists and is cleanly extracted. */
+  private async ensureSegmentFile(scan: Scan, seg: ShortSegmentState): Promise<string> {
+    const mediaDir = scanMediaDir(scan.id)
+    const segDir = path.join(mediaDir, 'segments')
+    const file = segmentPath(segDir, seg.index)
+    if (fs.existsSync(file)) {
+      try {
+        if (fs.statSync(file).size > 1024) return file
+      } catch {
+        /* re-extract */
+      }
+    }
+    const key = `${scan.id}|seg|${seg.index}`
+    let p = this.segCutLocks.get(key)
+    if (!p) {
+      p = (async () => {
+        fs.mkdirSync(segDir, { recursive: true })
+        addLog(scan, 'info', `Minute ${seg.index + 1}: preparing short segment ${ts(seg.start)}–${ts(seg.end)}`)
+        await extractSegment(path.join(mediaDir, 'short.mp4'), seg.start, seg.end, file)
+        return file
+      })().finally(() => this.segCutLocks.delete(key))
+      this.segCutLocks.set(key, p)
+    }
+    return p
+  }
+
   /** Upload ONE short-minute segment file per key lane (Files API uploads are per key).
-   *  The segment file is re-cut from the ORIGINAL short.mp4 if it went missing. */
+   *  The segment file is cleanly cut under an extraction lock so concurrent lanes never collide. */
   private async ensureSegmentUri(job: Job, lane: KeyLane, seg: ShortSegmentState): Promise<string> {
     const existing = lane.segUris.get(seg.index)
     if (existing) return existing
     let p = lane.segUriPromises.get(seg.index)
     if (!p) {
       p = (async () => {
-        const mediaDir = scanMediaDir(job.scan.id)
-        const segDir = path.join(mediaDir, 'segments')
-        const file = segmentPath(segDir, seg.index)
-        if (!fs.existsSync(file)) {
-          fs.mkdirSync(segDir, { recursive: true })
-          addLog(job.scan, 'info', `Minute ${seg.index + 1}: segment file missing — re-cutting ${ts(seg.start)}–${ts(seg.end)} from the original short`)
-          await extractSegment(path.join(mediaDir, 'short.mp4'), seg.start, seg.end, file)
-        }
+        const file = await this.ensureSegmentFile(job.scan, seg)
         addLog(job.scan, 'info', `Uploading short minute ${seg.index + 1} to the scanner (key ${lane.idx})...`)
         this.mark(job)
         const f = await uploadVideo(lane.ai, file)
@@ -1658,9 +1680,10 @@ class Scheduler {
       if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
       st.state = 'active'
       job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
+      const rawRes = await fn()
       st.usedToday = incrementModelUsage(m.id, lane.apiKey)
       this.mark(job)
-      return await fn()
+      return rawRes
     } catch (err) {
       const e = err instanceof GeminiError ? err : classifyError(err)
       if (e.kind === 'rate') {
@@ -1674,11 +1697,10 @@ class Scheduler {
     }
   }
 
-  /** BACKUP-UPLOAD + BUSY-RETRY (verify/rescan — "sab jagah" insurance):
-   *  clip ki EK backup copy background me pehle se upload hoti hai. Request
-   *  busy/overloaded/5xx fail ho to dobara upload ka time waste kiye BINA
-   *  turant backup URI se new request jaati hai — aur retry ke dauran agla
-   *  backup bhi ban jaata hai. Result aate hi unused backup delete. */
+  /** BACKUP-PREUPLOAD + BUSY-RETRY (verify/rescan):
+   *  Clip ki 1 backup copy parallel background me upload hoti hai.
+   *  Primary request success hote hi backup turant DELETE ho jata hai (zero unnecessary requests).
+   *  Agar primary request busy/503/429 fail ho to bina upload wait ke TURANT backup URI se retry hota hai. */
   private async sendWithClipBackup(
     job: Job,
     lane: KeyLane,
@@ -1702,18 +1724,16 @@ class Scheduler {
         if (!backup) throw err
         pendingBackup = null
         uploadedNames.push(backup.name)
-        addLog(job.scan, 'warn', `${busyLabel}: API busy — pre-uploaded BACKUP clip se turant retry (upload wait zero)`)
+        addLog(job.scan, 'warn', `${busyLabel}: API busy — pre-uploaded backup clip se turant retry (upload wait zero)`)
         this.mark(job)
-        // Retry ke dauran agla backup bhi taiyaar — dobara busy aaye to bhi ready.
-        pendingBackup = uploadVideo(lane.ai, filePath)
-        pendingBackup.catch(() => {})
         raw = await send(backup.uri)
       }
       return raw
     } finally {
-      // Result mil gaya (ya final fail) — bacha hua unused backup delete.
+      // Primary success ya failure — unused backup ko bina kisi deri ke turant delete karo
       if (pendingBackup) {
         void pendingBackup.then((f) => deleteFileQuiet(lane.ai, f.name)).catch(() => {})
+        pendingBackup = null
       }
     }
   }
@@ -2221,8 +2241,6 @@ class Scheduler {
       let chunkFileName: string | null = null
       /** consumed backup uploads (deleted in finally) */
       const backupNames: string[] = []
-      /** pending unused backup upload (deleted in finally if still set) */
-      let pendingBackup: Promise<{ uri: string; name: string }> | null = null
       let releaseGlobalLock: ((sec?: number) => void) | null = null
       try {
         releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
@@ -2279,24 +2297,17 @@ class Scheduler {
         const [shortUri, uploaded] = await uploadsP
         chunkFileName = uploaded.name
 
-        // BACKUP UPLOAD (API-busy insurance): isi chunk ki EK aur copy background
-        // me upload hoti hai. Agar request "busy/overloaded" fail ho to dobara
-        // upload ka time waste kiye BINA turant backup URI se new request jaati
-        // hai — aur retry ke dauran agla backup bhi ban jaata hai. Result aate
-        // hi saare unused backups delete ho jaate hain (Files API clean rahta hai).
-        const startBackup = () => {
-          pendingBackup = (async () => {
-            const file = await this.ensureChunkFile(scan, chunkIndex)
-            return uploadVideo(lane.ai, file)
-          })()
-          pendingBackup.catch(() => {})
-        }
-        startBackup()
+        // BACKUP PRE-UPLOAD (Parallel zero-wait insurance):
+        // Primary request chalu hone ke saath hi backup copy background me upload hoti hai.
+        // Primary request success hote hi backup turant DELETE ho jata hai.
+        // Agar primary busy/503/429 ho to bina upload wait ke backup URI se instant retry hota hai.
+        let pendingBackup: Promise<{ uri: string; name: string }> | null = (async () => {
+          const file = await this.ensureChunkFile(scan, chunkIndex)
+          return uploadVideo(lane.ai, file)
+        })()
+        pendingBackup.catch(() => {})
 
         job.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
-        const used = incrementModelUsage(m.id, lane.apiKey)
-        st.usedToday = used
-        this.mark(job)
 
         addLog(scan, 'info', `${minutePrefix}Chunk ${chunkIndex}: mapping short → movie minute ${chunkIndex} on ${m.id} (key ${lane.idx})`)
         // PIPELINING: while Gemini analyzes THIS chunk, the next chunk's
@@ -2308,27 +2319,29 @@ class Scheduler {
           raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
         } catch (reqErr) {
           // TRANSIENT-BUSY RETRY: API/model busy (overloaded / 5xx / rate) par
-          // pehle se ready BACKUP upload se TURANT ek new request — zero upload wait.
+          // pre-uploaded backup se TURANT retry (upload wait zero).
           const re = classifyError(reqErr)
           const transient =
             re.kind === 'rate' || /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
-          const backup = transient && pendingBackup ? await (pendingBackup as Promise<{ uri: string; name: string }>).catch(() => null) : null
+          const backup = transient && pendingBackup ? await pendingBackup.catch(() => null) : null
           if (!backup) throw reqErr
           pendingBackup = null
           backupNames.push(backup.name)
-          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: API busy on ${m.id} (key ${lane.idx}) — pre-uploaded BACKUP se turant retry (upload wait zero)`)
+          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: API busy on ${m.id} (key ${lane.idx}) — pre-uploaded backup se turant retry (upload wait zero)`)
           this.mark(job)
-          // Retry ke dauran agla backup bhi taiyaar — dobara busy aaye to bhi ready.
-          startBackup()
           raw = await mapChunkRequest(lane.ai, m.id, shortUri, backup.uri)
+        } finally {
+          // Primary request success ya final exit — unused backup ko bina kisi deri ke turant delete karo
+          if (pendingBackup) {
+            void pendingBackup.then((f) => deleteFileQuiet(lane.ai, f.name)).catch(() => {})
+            pendingBackup = null
+          }
         }
-        // Result mil gaya — bacha hua unused backup ab zaroori nahi, delete.
-        if (pendingBackup) {
-          void (pendingBackup as Promise<{ uri: string; name: string }>)
-            .then((f) => deleteFileQuiet(lane.ai, f.name))
-            .catch(() => {})
-          pendingBackup = null
-        }
+
+        const used = incrementModelUsage(m.id, lane.apiKey)
+        st.usedToday = used
+        this.mark(job)
+
         this.recordChunkOutput(chunk, m.id, raw)
 
         // Model timestamps are LOCAL to the 1-minute segment file — shift them by
@@ -2426,13 +2439,8 @@ class Scheduler {
         if (releaseGlobalLock) releaseGlobalLock(60)
         // The short video is reused across chunks; the chunk upload is one-shot.
         if (chunkFileName) void deleteFileQuiet(lane.ai, chunkFileName)
-        // Backup uploads: used copies + any still-pending unused copy — sab delete.
+        // Backup uploads: used copies — sab delete.
         for (const n of backupNames) void deleteFileQuiet(lane.ai, n)
-        if (pendingBackup) {
-          void (pendingBackup as Promise<{ uri: string; name: string }>)
-            .then((f) => deleteFileQuiet(lane.ai, f.name))
-            .catch(() => {})
-        }
         job.inFlight.delete(chunkIndex)
         st.currentChunk = null
         if (st.state === 'active') st.state = 'idle'
