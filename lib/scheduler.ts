@@ -133,6 +133,7 @@ function ts(sec: number): string {
   const s = sec - m * 60
   return `${String(m).padStart(2, '0')}:${s.toFixed(3).padStart(6, '0')}`
 }
+const fmtTime = ts
 
 /** ABSOLUTE original-movie window of a chunk: chunks cover ONLY the confirmed
  *  trim range, so every chunk's absolute start = trimStart + index * 60. */

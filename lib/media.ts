@@ -484,7 +484,8 @@ async function dirSize(dir: string): Promise<number> {
 
 function startUsageComputation(): Promise<number> {
   const currentGen = cacheGeneration
-  const p = (async () => {
+  let p: Promise<number> | null = null
+  p = (async () => {
     try {
       const used = await dirSize(MEDIA_DIR)
       if (cacheGeneration === currentGen) {

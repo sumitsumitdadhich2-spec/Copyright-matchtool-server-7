@@ -171,8 +171,9 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
   if (scan.geminiPrescan) {
     if (Array.isArray(scan.geminiPrescan.windows)) {
       for (const w of scan.geminiPrescan.windows) {
-        const attempts = Math.max(1, w.attempts || 1)
-        const model = w.modelId || 'gemini-3.7-flash'
+        const attempts = Math.max(1, (w as { attempts?: number }).attempts || 1)
+        const laneModel = w.lane?.split('·')[1]?.trim()
+        const model = laneModel || 'gemini-3.7-flash'
         const countNeeded = Math.max(0, attempts - (summary.byModel[normalizeModelName(model)]?.minuteFinder || 0))
         if (countNeeded > 0 && summary.byStage.minuteFinder === 0) {
           addUsage(normalizeModelName(model), 'minuteFinder', countNeeded)
@@ -181,8 +182,9 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     }
     if (scan.geminiPrescan.backup && Array.isArray(scan.geminiPrescan.backup.windows)) {
       for (const w of scan.geminiPrescan.backup.windows) {
-        const attempts = Math.max(1, w.attempts || 1)
-        const model = w.modelId || 'gemini-3.7-flash'
+        const attempts = Math.max(1, (w as { attempts?: number }).attempts || 1)
+        const laneModel = w.lane?.split('·')[1]?.trim()
+        const model = laneModel || 'gemini-3.7-flash'
         const countNeeded = Math.max(0, attempts - (summary.byModel[normalizeModelName(model)]?.minuteFinder || 0))
         if (countNeeded > 0 && summary.byStage.minuteFinder === 0) {
           addUsage(normalizeModelName(model), 'minuteFinder', countNeeded)
@@ -199,13 +201,10 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     for (const c of chunkList) {
       if (c && (c.status === 'match' || c.status === 'no_match' || c.status === 'failed')) {
         const attempts = Math.max(1, c.attempts || 1)
-        // If specific model recorded in output
-        if (c.modelOutputs && Object.keys(c.modelOutputs).length > 0) {
-          for (const m of Object.keys(c.modelOutputs)) {
-            addUsage(normalizeModelName(m), 'chunkScan', 1)
-          }
+        if (c.model) {
+          addUsage(normalizeModelName(c.model), 'chunkScan', attempts)
         } else {
-          // Distribute across primary 3 chunk models
+          // Distribute across primary chunk model
           addUsage('gemini-3.7-flash', 'chunkScan', attempts)
         }
       }

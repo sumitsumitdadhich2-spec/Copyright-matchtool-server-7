@@ -671,7 +671,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <button
             type="button"
             onClick={() => handleCycleMatch(-1)}
-            disabled={pairs.length <= 1 || rescanning}
+            disabled={pairs.length <= 1 || isCurrentRescanning}
             className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40"
             title="Previous match (← Left Arrow)"
           >
@@ -683,7 +683,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <button
             type="button"
             onClick={() => handleCycleMatch(1)}
-            disabled={pairs.length <= 1 || rescanning}
+            disabled={pairs.length <= 1 || isCurrentRescanning}
             className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40"
             title="Next match (→ Right Arrow)"
           >
@@ -898,7 +898,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           </button>
 
           {/* Model Selection Menu */}
-          {showModelPicker && !rescanning && (
+          {showModelPicker && !isCurrentRescanning && (
             <div className="absolute bottom-full left-0 mb-2 w-60 rounded-lg border border-indigo-500/30 bg-card/95 p-1.5 shadow-xl backdrop-blur-md z-50 animate-in fade-in zoom-in-95">
               <div className="px-2 py-1 text-[11px] font-semibold text-muted-foreground border-b border-border/50 mb-1 flex items-center justify-between">
                 <span>Choose Rescan Model:</span>
