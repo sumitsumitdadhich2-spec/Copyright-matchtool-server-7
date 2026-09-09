@@ -1,0 +1,171 @@
+import type { MatchOrigin, Scan } from './types'
+
+export interface RenderSegment {
+  movieStart: number
+  movieEnd: number
+  shortStart: number
+  shortEnd: number
+  /** provenance of the match this scene came from (first match of a merged run) */
+  origin?: MatchOrigin
+  originWindow?: number
+  /** REJECTED — KEPT: the verifier said DIFFERENT but the clip stays in the merge */
+  rejected?: boolean
+  /** the AI never managed to verify this window */
+  unverified?: boolean
+}
+
+/** Single source of truth for both instant preview and exported scene order.
+ *
+ *  Ordering rules:
+ *  1. Scenes ALWAYS follow the short video's timeline (shortStart ascending).
+ *  2. When two matches overlap on the short timeline, VERIFIED matches win
+ *     over unverified ones; ties break on the earlier movie window.
+ *  3. Overlapping tails are TRIMMED (1:1 time mapping) instead of dropping the
+ *     whole match, so no short-video coverage is silently lost.
+ *  4. Back-to-back matches that are continuous in BOTH clocks (e.g. a scene
+ *     crossing the 60s minute boundary of a 2-min short) are MERGED into one
+ *     scene, so the render has no artificial cut at the boundary. */
+export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[] {
+  const matches = [...(scan.matches || [])]
+    .filter((match) => match.movieEnd - match.movieStart > 0.05)
+    .sort(
+      (a, b) =>
+        a.shortStart - b.shortStart ||
+        Number(b.userPick === true) - Number(a.userPick === true) ||
+        Number(b.verified === true || b.batchVerified === 'confirmed') -
+          Number(a.verified === true || a.batchVerified === 'confirmed') ||
+        (b.confidence || 0) - (a.confidence || 0) ||
+        a.movieStart - b.movieStart,
+    )
+
+  const segments: RenderSegment[] = []
+  for (const match of matches) {
+    let { shortStart, movieStart } = match
+    const { shortEnd, movieEnd } = match
+    const previous = segments.at(-1)
+
+    const isUnverifiedCandidate =
+      match.userPick !== true && match.verified !== true && match.batchVerified !== 'confirmed'
+
+    // If this match is an unverified candidate and ANY verified/user-picked segment
+    // already covers this short time window, completely skip this candidate!
+    if (isUnverifiedCandidate) {
+      const alreadyCovered = segments.some(
+        (s) =>
+          !s.unverified &&
+          !s.rejected &&
+          (Math.abs(s.shortStart - shortStart) < 0.25 ||
+            Math.max(0, Math.min(s.shortEnd, shortEnd) - Math.max(s.shortStart, shortStart)) > 0.1),
+      )
+      if (alreadyCovered) {
+        continue
+      }
+    }
+
+    if (previous) {
+      const overlap = previous.shortEnd - shortStart
+      if (overlap > 0.05) {
+        const prevDuration = previous.shortEnd - previous.shortStart
+        const currDuration = shortEnd - shortStart
+        const shorter = Math.min(prevDuration, currDuration)
+        const isSameSegment =
+          (shorter > 0 && overlap / shorter >= 0.35) ||
+          overlap >= 0.35 ||
+          shortEnd <= previous.shortEnd + 0.05
+
+        if (isSameSegment) {
+          // Alternative candidate or duplicate for the already placed short segment — skip it.
+          continue
+        }
+
+        // If the previous segment was verified and the current candidate is unverified,
+        // NEVER slice and insert an unverified fragment into a verified scene seam!
+        if (!previous.unverified && !previous.rejected && isUnverifiedCandidate) {
+          continue
+        }
+
+        // Genuine partial boundary overlap between adjacent distinct scenes:
+        movieStart += previous.shortEnd - shortStart
+        shortStart = previous.shortEnd
+        if (shortEnd - shortStart <= 0.05 || movieEnd - movieStart <= 0.05) continue
+      }
+      // CONTINUITY MERGE: continuous in both the short AND the movie clock
+      // (typical at the 60s minute boundary of a multi-minute short).
+      if (
+        Math.abs(shortStart - previous.shortEnd) <= 0.25 &&
+        Math.abs(movieStart - previous.movieEnd) <= 0.25 &&
+        movieEnd > previous.movieEnd
+      ) {
+        previous.shortEnd = shortEnd
+        previous.movieEnd = movieEnd
+        continue
+      }
+    }
+
+    // Prevent unverified matches from duplicating an already placed movie scene elsewhere in the timeline
+    if (isUnverifiedCandidate) {
+      const isDuplicateMovieClip = segments.some(
+        (s) =>
+          Math.max(0, Math.min(s.movieEnd, movieEnd) - Math.max(s.movieStart, movieStart)) > 0.5 ||
+          (Math.abs(s.movieStart - movieStart) < 0.5 && Math.abs(s.movieEnd - movieEnd) < 0.5),
+      )
+      if (isDuplicateMovieClip) continue
+    }
+
+    const isConfirmed = match.verified === true || match.batchVerified === 'confirmed'
+    segments.push({
+      movieStart,
+      movieEnd,
+      shortStart,
+      shortEnd,
+      origin: match.origin ?? 'chunk',
+      originWindow: match.originWindow,
+      rejected: match.rejected === true && match.userPick !== true ? true : undefined,
+      unverified: !isConfirmed && match.rejected !== true ? true : undefined,
+    })
+  }
+  return segments
+}
+
+export function totalStitchedSeconds(segments: RenderSegment[]): number {
+  return segments.reduce((total, segment) => total + Math.max(0, segment.movieEnd - segment.movieStart), 0)
+}
+
+// ---------------------------------------------------------------------------
+// FRAME GRID SNAPPING
+//
+// Gemini reports millisecond timestamps, so a scene duration like 1.167 s is
+// 28.008 frames at 24 fps — ffmpeg's `fps=` filter emits the 29th frame and the
+// part runs +41 ms long. Over 77 scenes that stacked up to +1.78 s of drift on
+// a 2-minute render. Every scene is therefore snapped to the output frame grid
+// BEFORE encoding: an integer frame count is what gets encoded (`-frames:v`)
+// and what the expected total is computed from, so expected == actual.
+// ---------------------------------------------------------------------------
+
+export interface SnappedSegment extends RenderSegment {
+  /** exact number of output frames this scene contributes */
+  frames: number
+  /** frames / fps — the encoded duration, to the sample */
+  snapDur: number
+}
+
+/** Snap one duration to the frame grid (at least one frame). */
+export function snapFrames(dur: number, fps: number): { frames: number; snapDur: number } {
+  const frames = Math.max(1, Math.round(Math.max(0, dur) * fps))
+  return { frames, snapDur: frames / fps }
+}
+
+/** Snap every scene's START and DURATION to the output frame grid so seams
+ *  cannot shift and the total is an exact frame count. */
+export function snapSegments(segments: RenderSegment[], fps: number): SnappedSegment[] {
+  return segments.map((seg) => {
+    const movieStart = Math.max(0, Math.round(seg.movieStart * fps) / fps)
+    const { frames, snapDur } = snapFrames(seg.movieEnd - seg.movieStart, fps)
+    return { ...seg, movieStart, movieEnd: movieStart + snapDur, frames, snapDur }
+  })
+}
+
+/** Exact output length of a snapped scene list (sum of frame counts / fps). */
+export function totalSnappedSeconds(segments: SnappedSegment[], fps: number): number {
+  return segments.reduce((total, seg) => total + seg.frames, 0) / fps
+}
