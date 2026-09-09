@@ -493,9 +493,11 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     return b.totalRemaining - a.totalRemaining
   })
 
-  // Pick keys that actually have remaining quota (fallback to all keys if all appear exhausted)
+  // Pick top 2-3 keys that have remaining quota (prioritizing cached uploads for 0s wait)
   const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
-  const selectedKeys = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
+  const pool = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
+  const maxKeysForPrescan = Math.min(pool.length, Math.max(2, Math.min(3, Math.ceil(total / 2))))
+  const selectedKeys = pool.slice(0, maxKeysForPrescan)
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${selectedKeys.length} keys)...` })
   let uploadedKeys = 0
