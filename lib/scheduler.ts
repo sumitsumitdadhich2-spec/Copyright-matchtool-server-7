@@ -2372,8 +2372,15 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
 
+        // Always record error & diagnostic in chunk output so user can click 'AI output' and see what happened.
+        this.recordChunkOutput(
+          chunk,
+          m.id,
+          `[ERROR / DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nError: ${e.message}\nTime: ${new Date().toISOString()}`,
+        )
+
         // INFRASTRUCTURE / TRANSIENT ERROR CHECK:
-        // Quota limits, rate limits, model exhaustions, temporary 503s, and network/upload hiccups
+        // Quota limits, rate limits, model exhaustions, empty responses, temporary 503s, and network/upload hiccups
         // are properties of the API key/Gemini service — NEVER the chunk video itself!
         // These MUST NOT consume chunk.attempts, so transient bursts never mark a chunk as 'failed'!
         const isTransientInfra =
@@ -2381,7 +2388,8 @@ class Scheduler {
           e.kind === 'rpd' ||
           e.kind === 'unavailable' ||
           e.kind === 'invalid_key' ||
-          /file upload|processing timed out|socket|econnreset|etimedout|500|502|503|504|overload/i.test(e.message)
+          e.kind === 'empty' ||
+          /empty model response|empty response|no text returned|blockreason|safety|file upload|processing timed out|socket|econnreset|etimedout|500|502|503|504|overload/i.test(e.message)
 
         if (!isTransientInfra) {
           chunk.attempts = (chunk.attempts || 0) + 1
@@ -2420,6 +2428,10 @@ class Scheduler {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
           addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} safely re-queued for another worker/key`)
+        } else if (e.kind === 'empty') {
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
+          addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: empty response on ${m.id} (key ${lane.idx}) — diagnostic saved in AI Output; chunk safely re-queued for another worker`)
         } else {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

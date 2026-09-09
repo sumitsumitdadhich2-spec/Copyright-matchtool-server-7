@@ -29,26 +29,58 @@ export class GeminiError extends Error {
 
 interface GeminiPartLike {
   text?: string
+  thought?: boolean
 }
 
 interface GeminiCandidateLike {
   content?: {
     parts?: GeminiPartLike[]
   }
+  finishReason?: string
+  finishMessage?: string
+  safetyRatings?: Array<{ category?: string; probability?: string; blocked?: boolean }>
+}
+
+interface GeminiPromptFeedbackLike {
+  blockReason?: string
+  safetyRatings?: Array<{ category?: string; probability?: string; blocked?: boolean }>
 }
 
 interface GeminiResponseLike {
   text?: string | null
   candidates?: GeminiCandidateLike[]
+  promptFeedback?: GeminiPromptFeedbackLike
+  usageMetadata?: {
+    promptTokenCount?: number
+    candidatesTokenCount?: number
+    totalTokenCount?: number
+    thoughtsTokenCount?: number
+  }
 }
 
-/** Safely extracts text from a Gemini response, inspecting direct text and all candidate text parts. */
-export function extractResponseText(resp: GeminiResponseLike | unknown): string {
-  const r = resp as GeminiResponseLike | undefined
-  if (typeof r?.text === 'string' && r.text.trim()) {
-    return r.text.trim()
+export interface GeminiResponseDetails {
+  text: string
+  finishReason?: string
+  finishMessage?: string
+  blockReason?: string
+  promptFeedback?: GeminiPromptFeedbackLike
+  safetyRatings?: unknown[]
+  usageMetadata?: {
+    promptTokenCount?: number
+    candidatesTokenCount?: number
+    totalTokenCount?: number
+    thoughtsTokenCount?: number
   }
-  if (Array.isArray(r?.candidates)) {
+  diagnostic?: string
+}
+
+/** Detailed extractor that inspects candidate parts, direct text, and fallback thought parts with diagnostics. */
+export function extractResponseDetails(resp: GeminiResponseLike | unknown): GeminiResponseDetails {
+  const r = resp as GeminiResponseLike | undefined
+  let text = ''
+  if (typeof r?.text === 'string' && r.text.trim()) {
+    text = r.text.trim()
+  } else if (Array.isArray(r?.candidates)) {
     const allText: string[] = []
     for (const candidate of r.candidates) {
       if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
@@ -60,10 +92,50 @@ export function extractResponseText(resp: GeminiResponseLike | unknown): string 
       }
     }
     if (allText.length > 0) {
-      return allText.join('\n').trim()
+      text = allText.join('\n').trim()
     }
   }
-  return ''
+
+  const cand0 = r?.candidates?.[0]
+  const finishReason = cand0?.finishReason
+  const finishMessage = cand0?.finishMessage
+  const blockReason = r?.promptFeedback?.blockReason
+  const usageMetadata = r?.usageMetadata
+  const safetyRatings = cand0?.safetyRatings ?? r?.promptFeedback?.safetyRatings
+
+  let diagnostic = ''
+  if (!text) {
+    const partsCount = cand0?.content?.parts?.length ?? 0
+    const candCount = r?.candidates?.length ?? 0
+    const safetyStr = safetyRatings && safetyRatings.length > 0 ? JSON.stringify(safetyRatings) : 'none'
+    diagnostic =
+      `Empty model response from Gemini API:\n` +
+      `- Candidate Count: ${candCount}\n` +
+      `- Finish Reason: ${finishReason || 'UNKNOWN'}\n` +
+      (finishMessage ? `- Finish Message: ${finishMessage}\n` : '') +
+      (blockReason ? `- Prompt Block Reason: ${blockReason}\n` : '') +
+      `- Parts Count: ${partsCount}\n` +
+      `- Safety Ratings: ${safetyStr}\n` +
+      (usageMetadata
+        ? `- Usage: promptTokens=${usageMetadata.promptTokenCount ?? '?'}, candidateTokens=${usageMetadata.candidatesTokenCount ?? '?'}, thoughtTokens=${usageMetadata.thoughtsTokenCount ?? '?'}\n`
+        : '')
+  }
+
+  return {
+    text,
+    finishReason,
+    finishMessage,
+    blockReason,
+    promptFeedback: r?.promptFeedback,
+    safetyRatings,
+    usageMetadata,
+    diagnostic: diagnostic || undefined,
+  }
+}
+
+/** Safely extracts text from a Gemini response, inspecting direct text and all candidate text parts. */
+export function extractResponseText(resp: GeminiResponseLike | unknown): string {
+  return extractResponseDetails(resp).text
 }
 
 export function getClient(apiKey: string): GoogleGenAI {
@@ -380,10 +452,12 @@ export async function runMinuteFinderWindow(
       ],
       config: GEN_CONFIG,
     })
-    const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty minute-finder response')
-    const tokens = resp.usageMetadata?.totalTokenCount ?? null
-    return { text, tokens }
+    const details = extractResponseDetails(resp)
+    if (!details.text) {
+      throw new GeminiError('empty', details.diagnostic || `Empty minute-finder response (finishReason=${details.finishReason || 'unknown'})`)
+    }
+    const tokens = details.usageMetadata?.totalTokenCount ?? null
+    return { text: details.text, tokens }
   } catch (err) {
     throw classifyError(err)
   }
@@ -541,10 +615,12 @@ export async function runBackupMinuteFinderWindow(
       ],
       config: GEN_CONFIG,
     })
-    const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty backup minute-finder response')
-    const tokens = resp.usageMetadata?.totalTokenCount ?? null
-    return { text, tokens }
+    const details = extractResponseDetails(resp)
+    if (!details.text) {
+      throw new GeminiError('empty', details.diagnostic || `Empty backup minute-finder response (finishReason=${details.finishReason || 'unknown'})`)
+    }
+    const tokens = details.usageMetadata?.totalTokenCount ?? null
+    return { text: details.text, tokens }
   } catch (err) {
     throw classifyError(err)
   }
@@ -813,9 +889,11 @@ export async function mapChunkRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty model response')
-    return text
+    const details = extractResponseDetails(resp)
+    if (!details.text) {
+      throw new GeminiError('empty', details.diagnostic || `Empty model response (finishReason=${details.finishReason || 'unknown'})`)
+    }
+    return details.text
   } catch (err) {
     throw classifyError(err)
   }
@@ -1110,9 +1188,11 @@ export async function verifyRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty verifier response')
-    return text
+    const details = extractResponseDetails(resp)
+    if (!details.text) {
+      throw new GeminiError('empty', details.diagnostic || `Empty verifier response (finishReason=${details.finishReason || 'unknown'})`)
+    }
+    return details.text
   } catch (err) {
     throw classifyError(err)
   }
@@ -1147,9 +1227,11 @@ export async function rescanRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty rescan response')
-    return text
+    const details = extractResponseDetails(resp)
+    if (!details.text) {
+      throw new GeminiError('empty', details.diagnostic || `Empty rescan response (finishReason=${details.finishReason || 'unknown'})`)
+    }
+    return details.text
   } catch (err) {
     throw classifyError(err)
   }
