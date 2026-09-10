@@ -539,11 +539,24 @@ function WindowCard({ w, trimStart, open, onToggle }: { w: GeminiPrescanWindow; 
           {w.lane && <span>{w.lane.replace(/gemini-/, '')}</span>}
           {w.tokens ? <span className="font-mono">{w.tokens.toLocaleString()} tok</span> : null}
           {w.attempts && w.attempts > 1 ? <span>{w.attempts} attempts</span> : null}
+          {w.policyRetried && (
+            <span
+              className="rounded bg-warning/15 px-1.5 py-0.2 text-[10px] font-medium text-warning"
+              title="Google policy block caught — 1 sanitized retry (audio stripped + neutral prompt) executed"
+            >
+              Policy Retried (Muted)
+            </span>
+          )}
           {w.minutes && w.minutes.length > 0 && <span className="text-success">min {w.minutes.map((m) => m + 1).join(', ')}</span>}
         </div>
       </button>
-      {open && (w.raw || w.error) && (
+      {open && (w.raw || w.error || w.policyRetried) && (
         <div className="border-t border-border p-2">
+          {w.policyRetried && (
+            <p className="mb-1 text-[11px] text-warning">
+              ⚡ Policy Block Handled: Request was flagged by Google Content Policy (PROHIBITED_CONTENT). Automatically retried once using audio-stripped muted video copy and neutral frame alignment prompt.
+            </p>
+          )}
           {w.error && <p className="mb-1 text-[11px] text-destructive">{w.error}</p>}
           {w.raw && <pre className="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-muted-foreground">{w.raw}</pre>}
         </div>

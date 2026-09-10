@@ -187,19 +187,20 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
 
       if (isError) {
         const modelMatch = msg.match(/(gemini-[\w.-]+)/i)
-        if (modelMatch) {
-          const rawModel = normalizeModelName(modelMatch[1])
-          let stage: keyof ScanUsageSummary['byStage'] = 'chunkScan'
-          if (lower.includes('rescan')) stage = 'rescan'
-          else if (lower.includes('verifier') || lower.includes('verify')) stage = 'verifier'
-          else if (lower.includes('missing-scene') || lower.includes('missing scene')) stage = 'missingScene'
-          else if (lower.includes('window') || lower.includes('minute finder')) stage = 'minuteFinder'
+        let stage: keyof ScanUsageSummary['byStage'] = 'chunkScan'
+        if (lower.includes('rescan')) stage = 'rescan'
+        else if (lower.includes('verifier') || lower.includes('verify')) stage = 'verifier'
+        else if (lower.includes('missing-scene') || lower.includes('missing scene')) stage = 'missingScene'
+        else if (lower.includes('window') || lower.includes('minute finder') || lower.includes('prescan')) stage = 'minuteFinder'
 
-          const key = `err-${timeKey}-${rawModel}-${msg.slice(0, 40)}`
-          if (!loggedErrors.has(key)) {
-            loggedErrors.add(key)
-            recordRequest(rawModel, stage, false, errorCategory)
-          }
+        const defaultModelForStage =
+          stage === 'verifier' ? 'gemini-3.5-flash-lite' : stage === 'rescan' ? 'gemini-3-flash-preview' : 'gemini-3.7-flash'
+        const rawModel = normalizeModelName(modelMatch ? modelMatch[1] : defaultModelForStage)
+
+        const key = `err-${timeKey}-${rawModel}-${msg.slice(0, 40)}`
+        if (!loggedErrors.has(key)) {
+          loggedErrors.add(key)
+          recordRequest(rawModel, stage, false, errorCategory)
         }
         continue
       }
@@ -265,14 +266,47 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
   // 2. Structural sync from scan data objects (guarantees accurate counts even with sparse logs)
   if (scan.geminiPrescan?.windows && Array.isArray(scan.geminiPrescan.windows)) {
     const prescanDone = scan.geminiPrescan.windows.filter((w) => w.status === 'done' || w.hits !== undefined)
-    if (summary.byStage.minuteFinder < prescanDone.length) {
-      for (const w of prescanDone) {
-        const laneModel = w.lane?.split('·')[1]?.trim()
-        const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
-        const key = `struct-win-${w.index}-${model}`
-        if (!loggedEffective.has(key)) {
-          loggedEffective.add(key)
-          recordRequest(model, 'minuteFinder', true)
+    for (const w of prescanDone) {
+      const laneModel = w.lane?.split('·')[1]?.trim()
+      const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
+      const key = `struct-win-${w.index}-${model}`
+      if (!loggedEffective.has(key)) {
+        loggedEffective.add(key)
+        recordRequest(model, 'minuteFinder', true)
+      }
+    }
+    // Prohibited policy retries on minute finder windows
+    for (const w of scan.geminiPrescan.windows) {
+      if (w.policyRetried) {
+        const key = `struct-win-policy-${w.index}`
+        if (!loggedErrors.has(key)) {
+          loggedErrors.add(key)
+          const laneModel = w.lane?.split('·')[1]?.trim()
+          recordRequest(normalizeModelName(laneModel || 'gemini-3.7-flash'), 'minuteFinder', false, 'prohibitedPolicy')
+        }
+      }
+    }
+  }
+
+  // Backup pass windows
+  if (scan.geminiPrescan?.backup?.windows && Array.isArray(scan.geminiPrescan.backup.windows)) {
+    const backupDone = scan.geminiPrescan.backup.windows.filter((w) => w.status === 'done' || w.hits !== undefined)
+    for (const w of backupDone) {
+      const laneModel = w.lane?.split('·')[1]?.trim()
+      const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
+      const key = `struct-bwin-${w.index}-${model}`
+      if (!loggedEffective.has(key)) {
+        loggedEffective.add(key)
+        recordRequest(model, 'minuteFinder', true)
+      }
+    }
+    for (const w of scan.geminiPrescan.backup.windows) {
+      if (w.policyRetried) {
+        const key = `struct-bwin-policy-${w.index}`
+        if (!loggedErrors.has(key)) {
+          loggedErrors.add(key)
+          const laneModel = w.lane?.split('·')[1]?.trim()
+          recordRequest(normalizeModelName(laneModel || 'gemini-3.7-flash'), 'minuteFinder', false, 'prohibitedPolicy')
         }
       }
     }
@@ -283,13 +317,22 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
   const chunkList = chunks.length > 0 ? chunks : scan.chunks || []
   const completedChunks = chunkList.filter((c) => c && (c.status === 'match' || c.status === 'no_match'))
 
-  if (summary.byStage.chunkScan < completedChunks.length) {
-    for (const c of completedChunks) {
-      const model = normalizeModelName(c.model || 'gemini-3.7-flash')
-      const key = `struct-chunk-${c.index}-${model}`
-      if (!loggedEffective.has(key)) {
-        loggedEffective.add(key)
-        recordRequest(model, 'chunkScan', true)
+  for (const c of completedChunks) {
+    const model = normalizeModelName(c.model || 'gemini-3.7-flash')
+    const key = `struct-chunk-${c.index}-${model}`
+    if (!loggedEffective.has(key)) {
+      loggedEffective.add(key)
+      recordRequest(model, 'chunkScan', true)
+    }
+  }
+
+  // Chunk policy retries
+  for (const c of chunkList) {
+    if (c.policyRetried) {
+      const key = `struct-chunk-policy-${c.index}`
+      if (!loggedErrors.has(key)) {
+        loggedErrors.add(key)
+        recordRequest(normalizeModelName(c.model || 'gemini-3.7-flash'), 'chunkScan', false, 'prohibitedPolicy')
       }
     }
   }

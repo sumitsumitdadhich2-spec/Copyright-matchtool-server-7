@@ -5,7 +5,7 @@ import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
 import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
-import { preparePrescanMovieCopy, buildBackupClip } from './ffmpeg'
+import { preparePrescanMovieCopy, buildBackupClip, sanitizeVideoMute } from './ffmpeg'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, type ModelSpec } from './models'
 import {
   getClient,
@@ -16,6 +16,8 @@ import {
   parseMinuteFinderOutput,
   runBackupMinuteFinderWindow,
   parseBackupMinuteFinderOutput,
+  buildMinuteFinderSanitizedPrompt,
+  buildBackupMinuteFinderSanitizedPrompt,
   backupClipFps,
   fmtClock,
   classifyError,
@@ -763,34 +765,108 @@ function isFileGoneError(msg: string): boolean {
 
 // ---------------------------------------------------------------------------
 
-/** Send ONE request for a window on this lane — pass-specific bits only. */
+/** Ensure a sanitized (muted audio, normalized contrast) upload exists for this key in normal pass. */
+async function ensureSanitizedShortUpload(
+  id: string,
+  ctrl: Ctrl,
+  lane: Lane,
+  shortFile: string,
+): Promise<{ uri: string; name: string }> {
+  const cached = ctrl.state.uploads[lane.keyId]
+  if (cached?.sanitizedShortUri && cached?.sanitizedShortName) {
+    const active = await fileActive(lane.ai, cached.sanitizedShortName)
+    if (active) return { uri: cached.sanitizedShortUri, name: cached.sanitizedShortName }
+  }
+
+  const mediaDir = scanMediaDir(id)
+  const sanitizedDir = path.join(mediaDir, 'sanitized')
+  fs.mkdirSync(sanitizedDir, { recursive: true })
+  const sanitizedFile = path.join(sanitizedDir, 'prescan-short-muted.mp4')
+  if (!fs.existsSync(sanitizedFile)) {
+    log(id, 'info', `[Policy Mitigation] Creating sanitized short video copy (muted audio, normalized contrast)...`)
+    await sanitizeVideoMute(shortFile, sanitizedFile)
+  }
+
+  log(id, 'info', `Key ${lane.keyIdx}: uploading sanitized short video copy to Gemini Files API...`)
+  const up = await uploadVideo(lane.ai, sanitizedFile, 'video/mp4', 'prescan-short-sanitized')
+  if (ctrl.state.uploads[lane.keyId]) {
+    ctrl.state.uploads[lane.keyId].sanitizedShortUri = up.uri
+    ctrl.state.uploads[lane.keyId].sanitizedShortName = up.name
+    persist(id, ctrl)
+  }
+  return up
+}
+
+/** Ensure a sanitized (muted audio, normalized contrast) upload exists for this key in backup pass. */
+async function ensureSanitizedBackupClipUpload(
+  id: string,
+  ctrl: Ctrl,
+  lane: Lane,
+  clipPath: string,
+): Promise<{ uri: string; name: string }> {
+  const b = ctrl.state.backup
+  const cached = b?.uploads[lane.keyId]
+  if (cached?.sanitizedUri && cached?.sanitizedName) {
+    const active = await fileActive(lane.ai, cached.sanitizedName)
+    if (active) return { uri: cached.sanitizedUri, name: cached.sanitizedName }
+  }
+
+  const mediaDir = scanMediaDir(id)
+  const sanitizedDir = path.join(mediaDir, 'sanitized')
+  fs.mkdirSync(sanitizedDir, { recursive: true })
+  const sanitizedClipFile = path.join(sanitizedDir, 'backup-clip-muted.mp4')
+  if (!fs.existsSync(sanitizedClipFile)) {
+    log(id, 'info', `[Policy Mitigation] Creating sanitized backup clip copy (muted audio, normalized contrast)...`)
+    await sanitizeVideoMute(clipPath, sanitizedClipFile)
+  }
+
+  log(id, 'info', `Key ${lane.keyIdx}: uploading sanitized backup clip copy to Gemini Files API...`)
+  const up = await uploadVideo(lane.ai, sanitizedClipFile, 'video/mp4', 'backup-clip-sanitized')
+  if (ctrl.state.backup) {
+    if (!ctrl.state.backup.uploads) ctrl.state.backup.uploads = {}
+    const existing = ctrl.state.backup.uploads[lane.keyId] || { uri: up.uri, name: up.name, uploadedAt: Date.now() }
+    existing.sanitizedUri = up.uri
+    existing.sanitizedName = up.name
+    ctrl.state.backup.uploads[lane.keyId] = existing
+    persist(id, ctrl)
+  }
+  return up
+}
+
+/** Send ONE request for a window on this lane — pass-specific bits only. Supports sanitized mode. */
 async function sendWindow(
   ctrl: Ctrl,
   lane: Lane,
   w: GeminiPrescanWindow,
   pass: Pass,
+  sanitized: boolean = false,
 ): Promise<{ text: string; tokens: number | null; parsed: MinuteFinderParse }> {
   const up = ctrl.state.uploads[lane.keyId]
   if (!up?.movieUri) throw new Error('files/ missing movie upload for this key')
   if (pass === 'normal') {
-    if (!up.shortUri) throw new Error('files/ missing short upload for this key')
-    const { text, tokens } = await runMinuteFinderWindow(lane.ai, lane.model.id, up.shortUri, up.movieUri, w.startOffset, w.endOffset)
+    const shortUri = sanitized && up.sanitizedShortUri ? up.sanitizedShortUri : up.shortUri
+    if (!shortUri) throw new Error('files/ missing short upload for this key')
+    const prompt = sanitized ? buildMinuteFinderSanitizedPrompt(w.startOffset, w.endOffset) : undefined
+    const { text, tokens } = await runMinuteFinderWindow(lane.ai, lane.model.id, shortUri, up.movieUri, w.startOffset, w.endOffset, prompt)
     return { text, tokens, parsed: parseMinuteFinderOutput(text, w.startOffset, w.endOffset, WINDOW_TIMESTAMPS_RELATIVE) }
   }
   const b = ctrl.state.backup
   const clipUp = b?.uploads[lane.keyId]
   if (!b?.clip || !clipUp?.uri) throw new Error('files/ missing backup clip upload for this key')
+  const clipUri = sanitized && clipUp.sanitizedUri ? clipUp.sanitizedUri : clipUp.uri
   const parts: BackupPartSpec[] = b.parts
+  const prompt = sanitized ? buildBackupMinuteFinderSanitizedPrompt(w.startOffset, w.endOffset, b.clip.fps, parts) : undefined
   const { text, tokens } = await runBackupMinuteFinderWindow(
     lane.ai,
     lane.model.id,
-    clipUp.uri,
+    clipUri,
     up.movieUri,
     w.startOffset,
     w.endOffset,
     b.clip.fps,
     parts,
     b.foundSummary || 'NONE',
+    prompt,
   )
   return { text, tokens, parsed: parseBackupMinuteFinderOutput(text, w.startOffset, w.endOffset, WINDOW_TIMESTAMPS_RELATIVE, parts) }
 }
@@ -906,7 +982,53 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)}): ${pass === 'backup' ? `missing-parts clip @${clipFps}fps` : 'short @10fps'} + window @1fps on ${lane.label}`,
       )
 
-      const { text, tokens, parsed } = await sendWindow(ctrl, lane, w, pass)
+      let sendResult: { text: string; tokens: number | null; parsed: MinuteFinderParse }
+      const alreadyPolicyRetried = Boolean(w.policyRetried)
+
+      try {
+        if (alreadyPolicyRetried) {
+          if (pass === 'normal') {
+            await ensureSanitizedShortUpload(id, ctrl, lane, env.shortFile)
+          } else {
+            const clipPath = ctrl.state.backup?.clip?.path || path.join(scanMediaDir(id), 'backup-clip.mp4')
+            await ensureSanitizedBackupClipUpload(id, ctrl, lane, clipPath)
+          }
+        }
+        sendResult = await sendWindow(ctrl, lane, w, pass, alreadyPolicyRetried)
+      } catch (reqErr) {
+        const re = classifyError(reqErr)
+        const isPolicyBlocked =
+          re.kind === 'policy_blocked' ||
+          /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
+
+        if (isPolicyBlocked && !w.policyRetried) {
+          w.policyRetried = true
+          log(
+            id,
+            'warn',
+            `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)}): Flagged by Google Policy (PROHIBITED_CONTENT) on ${lane.label} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral Alignment prompt...`,
+          )
+          persist(id, ctrl)
+
+          if (pass === 'normal') {
+            await ensureSanitizedShortUpload(id, ctrl, lane, env.shortFile)
+          } else {
+            const clipPath = ctrl.state.backup?.clip?.path || path.join(scanMediaDir(id), 'backup-clip.mp4')
+            await ensureSanitizedBackupClipUpload(id, ctrl, lane, clipPath)
+          }
+
+          sendResult = await sendWindow(ctrl, lane, w, pass, true)
+          log(
+            id,
+            'success',
+            `${tag} #${w.index}: Sanitized retry succeeded after policy flag bypass (${sendResult.parsed.hits.length} hit(s)) on ${lane.label}`,
+          )
+        } else {
+          throw reqErr
+        }
+      }
+
+      const { text, tokens, parsed } = sendResult
       incrementModelUsage(lane.model.id, lane.apiKey)
 
       // Parse sanity: no hits AND no recognizable HISSA 3 / NOT FOUND => retry.
@@ -974,7 +1096,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
           log(id, 'error', `Key ${lane.keyIdx}: re-upload failed: ${upErr instanceof Error ? upErr.message : String(upErr)}`)
           lane.dead = true
         }
-      } else if ((w.attempts || 0) >= MAX_WINDOW_ATTEMPTS) {
+      } else if ((w.attempts || 0) >= MAX_WINDOW_ATTEMPTS || (e.kind === 'policy_blocked' && w.policyRetried)) {
         w.status = 'failed'
         w.error = e.message.slice(0, 200)
         log(id, 'error', `${tag} #${w.index} failed after ${w.attempts} attempt(s): ${e.message.slice(0, 140)}`)

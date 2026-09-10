@@ -42,23 +42,40 @@ export function ReportPanel({ scan }: { scan: Scan }) {
 
   // Helper to accurately match a ChunkMatch with its CandidateGroup
   const findAssociatedGroup = useCallback((m: ChunkMatch): CandidateGroup | undefined => {
-    // 1. Try exact/close short timestamp match
-    const byShort = candidateGroups.find(
-      (g) => Math.abs(g.shortStart - m.shortStart) <= 0.25 || (m.shortStart >= g.shortStart - 0.1 && m.shortEnd <= g.shortEnd + 0.1),
-    )
-    if (byShort) return byShort
-
-    // 2. Try candidate movie chunk / movie timestamp match
-    return candidateGroups.find((g) =>
+    // 1. First priority: candidate match by chunkIndex and movieStart
+    const byCandidate = candidateGroups.find((g) =>
       (g.candidates || []).some(
         (c) => c.chunkIndex === m.chunkIndex && Math.abs(c.movieStart - m.movieStart) <= 1.0,
       ),
+    )
+    if (byCandidate) return byCandidate
+
+    // 2. Second priority: candidate match by chunkIndex and short range
+    const byShortAndChunk = candidateGroups.find(
+      (g) =>
+        Math.abs(g.shortStart - m.shortStart) <= 0.35 &&
+        (g.candidates || []).some((c) => c.chunkIndex === m.chunkIndex),
+    )
+    if (byShortAndChunk) return byShortAndChunk
+
+    // 3. Fallback: match by close short timestamp
+    return candidateGroups.find(
+      (g) => Math.abs(g.shortStart - m.shortStart) <= 0.25 || (m.shortStart >= g.shortStart - 0.1 && m.shortEnd <= g.shortEnd + 0.1),
     )
   }, [candidateGroups])
 
   // Get rich live status badge
   const getMatchLiveStatus = (m: ChunkMatch, group?: CandidateGroup) => {
-    const isRejected = isRejectedKept(m) || m.rejected === true || m.batchVerified === 'rejected'
+    const isRejected = isRejectedKept(m) || m.rejected === true || m.batchVerified === 'rejected' || (group?.status === 'rejected')
+
+    if (isRejected) {
+      return (
+        <span className="inline-flex items-center gap-1 text-xs font-semibold text-destructive">
+          <XCircle className="size-3.5" />
+          confirm no (rejected)
+        </span>
+      )
+    }
 
     if (group) {
       if (group.status === 'verifying') {
@@ -87,27 +104,10 @@ export function ReportPanel({ scan }: { scan: Scan }) {
         )
       }
       if (group.status === 'confirmed') {
-        // If this match is rejected kept while another candidate in group got confirmed
-        if (isRejected) {
-          return (
-            <span className="inline-flex items-center gap-1 text-xs font-semibold text-destructive">
-              <XCircle className="size-3.5" />
-              no (rejected kept)
-            </span>
-          )
-        }
         return (
           <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-500">
             <CheckCircle2 className="size-3.5" />
-            yes ({group.confirmedViaRescan ? 'rescan verified' : '24fps batch'})
-          </span>
-        )
-      }
-      if (group.status === 'rejected') {
-        return (
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-destructive">
-            <XCircle className="size-3.5" />
-            no (rejected)
+            confirm yes ({group.confirmedViaRescan ? 'rescan verified' : '24fps batch'})
           </span>
         )
       }
@@ -121,21 +121,11 @@ export function ReportPanel({ scan }: { scan: Scan }) {
       }
     }
 
-    // Static fallback if group is not loaded
-    if (isRejected) {
-      return (
-        <span className="inline-flex items-center gap-1 text-xs font-semibold text-destructive">
-          <XCircle className="size-3.5" />
-          no (rejected)
-        </span>
-      )
-    }
-
     if (m.verified || m.batchVerified === 'confirmed') {
       return (
         <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-500">
           <CheckCircle2 className="size-3.5" />
-          {m.batchVerified === 'confirmed' ? 'yes (batch 24fps)' : m.viaRescan ? 'yes (rescan)' : 'yes'}
+          confirm yes ({m.batchVerified === 'confirmed' ? 'batch 24fps' : m.viaRescan ? 'rescan' : 'verified'})
         </span>
       )
     }
@@ -177,29 +167,41 @@ export function ReportPanel({ scan }: { scan: Scan }) {
           </span>
         )
       }
-      const rescanCand = group.candidates.find((c) => c.rescan === 'found' || c.rescan === 'not_found')
+
+      const rescanCand =
+        group.candidates.find((c) => c.chunkIndex === m.chunkIndex && (c.rescan === 'found' || c.rescan === 'not_found')) ||
+        group.candidates.find((c) => c.rescan === 'found' || c.rescan === 'not_found')
+
       if (rescanCand) {
-        if (rescanCand.rescan === 'found' && rescanCand.rescanVerdict === 'same') {
+        if (rescanCand.rescan === 'found') {
+          if (rescanCand.rescanVerdict === 'same') {
+            return (
+              <span className="inline-flex items-center gap-1 font-semibold text-emerald-500">
+                <RefreshCw className="size-3 text-emerald-500" />
+                Rescanned → Confirmed (Yes)
+              </span>
+            )
+          }
+          if (rescanCand.rescanVerdict === 'different') {
+            return (
+              <span className="inline-flex items-center gap-1 font-semibold text-destructive">
+                <RefreshCw className="size-3 text-destructive" />
+                Rescanned → Confirm No (Rejected)
+              </span>
+            )
+          }
           return (
-            <span className="inline-flex items-center gap-1 font-semibold text-emerald-500">
-              <RefreshCw className="size-3 text-emerald-500" />
-              Rescanned → Confirmed (Yes)
-            </span>
-          )
-        }
-        if (rescanCand.rescan === 'found' && rescanCand.rescanVerdict === 'different') {
-          return (
-            <span className="inline-flex items-center gap-1 text-destructive">
-              <RefreshCw className="size-3 text-destructive" />
-              Rescanned → No (Rejected)
+            <span className="inline-flex items-center gap-1 font-medium text-blue-400">
+              <RefreshCw className="size-3 text-blue-400" />
+              Rescanned → Verifying
             </span>
           )
         }
         if (rescanCand.rescan === 'not_found') {
           return (
-            <span className="inline-flex items-center gap-1 text-muted-foreground">
+            <span className="inline-flex items-center gap-1 font-medium text-muted-foreground">
               <RefreshCw className="size-3" />
-              Rescanned → Not found
+              Rescanned → No (Not found)
             </span>
           )
         }

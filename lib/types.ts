@@ -483,6 +483,8 @@ export interface GeminiPrescanWindow {
   raw?: string
   error?: string
   attempts?: number
+  /** Set to true when this window encountered a policy violation and completed its 1 sanitized retry */
+  policyRetried?: boolean
 }
 
 export interface GeminiPrescanUpload {
@@ -491,6 +493,9 @@ export interface GeminiPrescanUpload {
   movieUri: string
   movieName: string
   uploadedAt: number
+  /** Muted/sanitized short video upload URI used for policy-blocked window retries */
+  sanitizedShortUri?: string
+  sanitizedShortName?: string
 }
 
 /** One PART of the backup clip = one missing short range (already padded ±2 s). */
@@ -533,7 +538,7 @@ export interface GeminiBackupState {
     signature: string
   }
   /** keyed by apiKeyHash — clip upload per key */
-  uploads: Record<string, { uri: string; name: string; uploadedAt: number }>
+  uploads: Record<string, { uri: string; name: string; uploadedAt: number; sanitizedUri?: string; sanitizedName?: string }>
   /** same offsets as the normal windows; queue order is smart (found range first) */
   windows: GeminiPrescanWindow[]
   /** FOUND_SUMMARY text given to the model as context */

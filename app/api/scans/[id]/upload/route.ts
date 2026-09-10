@@ -221,12 +221,12 @@ async function reuseFromScan(req: Request, id: string, kind: MediaKind, name: st
   }
 
   void mirrorReusedMedia(id, kind, sourceId, req.headers.get('x-video-type') || 'video/mp4')
-  await afterMediaReady(id, kind)
+  await afterMediaReady(id)
   return NextResponse.json({ ok: true, done: true, reused: true, duration: result.duration, size: result.size })
 }
 
 /** Post-upload hooks shared by the stream path and the reuse path. */
-async function afterMediaReady(id: string, _kind: MediaKind) {
+async function afterMediaReady(id: string) {
   // AUTO MINUTE FINDER trigger: agar dono videos (short + movie) ready hain
   // aur trim confirmed / auto-confirmed hai → user ke toggle ke hisaab se
   // Gemini Minute Finder (Window mode) auto-start ho jayega.
@@ -494,7 +494,7 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
 
   // Durable copy to S3 in the background — the user never waits for it.
   void mirrorMediaToStorage(id, kind, req.headers.get('x-video-type') || 'video/mp4')
-  await afterMediaReady(id, kind)
+  await afterMediaReady(id)
 
   return NextResponse.json({ ok: true, done: true, duration: result.duration, size: result.size, uploadKey: `${id}/${kind}`, scanId: id, kind })
 }

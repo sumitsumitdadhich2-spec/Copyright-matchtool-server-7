@@ -372,13 +372,20 @@ export async function verifySingleMinute(
       }
 
       if (match) {
-        match.batchVerified = isConfirmed ? 'confirmed' : 'rejected'
-        match.batchVerdict = p.verdict
-        match.batchReason = p.reason
+        // If user explicitly picked or rescanned this scene, preserve their choice!
+        const preserveUserChoice = Boolean(match.userPick || match.viaRescan)
+        const effectiveConfirmed = isConfirmed || preserveUserChoice
+
+        match.batchVerified = effectiveConfirmed ? 'confirmed' : 'rejected'
+        match.batchVerdict = effectiveConfirmed ? 'CONFIRMED' : p.verdict
+        match.batchReason =
+          preserveUserChoice && !isConfirmed
+            ? `User verified selection preserved (${match.reason || 'User review'})`
+            : p.reason
         match.batchModel = chosenModel
         match.batchTimestamp = Date.now()
-        match.rescanRequired = !isConfirmed
-        if (isConfirmed) {
+        match.rescanRequired = !effectiveConfirmed
+        if (effectiveConfirmed) {
           match.verified = true
           match.rejected = false
 

@@ -158,7 +158,7 @@ export function LogsPanel({ scan }: { scan: Scan }) {
   const [copied, setCopied] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
 
-  const logs = Array.isArray(scan.logs) ? scan.logs : []
+  const logs = useMemo(() => (Array.isArray(scan.logs) ? scan.logs : []), [scan.logs])
 
   // Auto-scroll when new logs arrive (if autoScroll is enabled)
   useEffect(() => {

@@ -475,6 +475,46 @@ export function buildMinuteFinderPrompt(startOffsetSec: number, endOffsetSec: nu
   )
 }
 
+/** Neutral, sanitized prompt for Gemini Minute Finder window policy retry (pure visual alignment, no dialogue or narrative interpretation). */
+export const MINUTE_FINDER_SANITIZED_PROMPT = `You are an automated visual frame-level timestamp alignment system. You are given TWO silent video streams:
+- Video 1: Reference short video (sampled at 10 fps).
+- Video 2: Search segment covering movie window {{WINDOW_START}} to {{WINDOW_END}} (sampled at 1 fps).
+
+Task: Pure visual frame alignment only. Do not generate semantic narrative interpretations, dialogues, or conversational commentary. Determine which movie minutes contain matching visual frames from Video 1.
+
+Structure your answer in three sections:
+
+=====================
+HISSA 1 — SHORT VIDEO SCENE MAP
+=====================
+Break Video 1 into visual sub-intervals:
+S1: mm:ss - mm:ss | visual segment 1
+S2: mm:ss - mm:ss | visual segment 2
+
+=====================
+HISSA 2 — MOVIE LOCATION HUNT
+=====================
+For each segment from HISSA 1, locate corresponding visual frames in Video 2:
+S<n> --> MATCH | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | EVIDENCE: visual frame match
+If uncertain:
+S<n> --> POSSIBLE | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | REASON: visual similarity
+If not present:
+S<n> --> NOT FOUND — not present in this window
+
+=====================
+HISSA 3 — MINUTE LIST (FINAL)
+=====================
+MATCH MINUTES: <comma separated minute numbers, ascending, e.g. 23, 24> (or NONE)
+POSSIBLE MINUTES: <comma separated minute numbers> (or NONE)
+WINDOW VERDICT: FOUND / POSSIBLE ONLY / NOT IN THIS WINDOW`
+
+export function buildMinuteFinderSanitizedPrompt(startOffsetSec: number, endOffsetSec: number): string {
+  return MINUTE_FINDER_SANITIZED_PROMPT.replaceAll('{{WINDOW_START}}', fmtClock(startOffsetSec)).replaceAll(
+    '{{WINDOW_END}}',
+    fmtClock(endOffsetSec),
+  )
+}
+
 /** One minute-finder request: whole short @ 10 fps + one 20-minute movie window
  * (default 1 fps, selected with startOffset/endOffset on the SAME uploaded movie
  * copy). Same GEN_CONFIG as the chunk scan (thinking HIGH, max output tokens). */
@@ -485,6 +525,7 @@ export async function runMinuteFinderWindow(
   movieUri: string,
   startOffsetSec: number,
   endOffsetSec: number,
+  customPrompt?: string,
 ): Promise<{ text: string; tokens: number | null }> {
   try {
     const resp = await ai.models.generateContent({
@@ -499,7 +540,7 @@ export async function runMinuteFinderWindow(
               // NO fps here — default 1 fps for the movie window.
               videoMetadata: { startOffset: `${Math.floor(startOffsetSec)}s`, endOffset: `${Math.ceil(endOffsetSec)}s` },
             },
-            { text: buildMinuteFinderPrompt(startOffsetSec, endOffsetSec) },
+            { text: customPrompt || buildMinuteFinderPrompt(startOffsetSec, endOffsetSec) },
           ] as never,
         },
       ],
@@ -635,6 +676,50 @@ export function buildBackupMinuteFinderPrompt(
     .replaceAll('{{FOUND_SUMMARY}}', foundSummary.trim() || 'NONE')
 }
 
+/** Neutral, sanitized prompt for Gemini Backup Minute Finder window policy retry (pure visual alignment, no dialogue or narrative interpretation). */
+export const BACKUP_MINUTE_FINDER_SANITIZED_PROMPT = `You are an automated visual frame-level timestamp alignment system. You are given TWO silent video streams:
+- Video 1: Reference missing clips concatenated (sampled at {{CLIP_FPS}} fps).
+- Video 2: Search segment covering movie window {{WINDOW_START}} to {{WINDOW_END}} (sampled at 1 fps).
+
+CLIP PART MAP:
+{{PART_MAP}}
+
+Task: Pure visual frame alignment only. Do not generate semantic narrative interpretations, dialogues, or conversational commentary. Determine which movie minutes contain matching visual frames from Video 1.
+
+Structure your answer in three sections:
+
+=====================
+HISSA 1 — CLIP PART MAP (LIGHT)
+=====================
+P<part>-S<n>: clip mm:ss - mm:ss | short mm:ss - mm:ss | TYPE: MOVIE-FOOTAGE | visual segment
+
+=====================
+HISSA 2 — DEEP MOVIE HUNT
+=====================
+P<part>-S<n> --> MATCH | SHORT mm:ss - mm:ss | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | EVIDENCE: visual frame match
+P<part>-S<n> --> POSSIBLE | SHORT mm:ss - mm:ss | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | REASON: visual similarity
+P<part>-S<n> --> NOT FOUND — not in this window
+
+=====================
+HISSA 3 — MINUTE LIST (FINAL)
+=====================
+MATCH MINUTES: <comma separated minute numbers, ascending> (or NONE)
+POSSIBLE MINUTES: <comma separated minute numbers> (or NONE)
+PART STATUS: P1=<FOUND/POSSIBLE/NOT-HERE/NON-MOVIE>
+WINDOW VERDICT: FOUND / POSSIBLE ONLY / NOT IN THIS WINDOW`
+
+export function buildBackupMinuteFinderSanitizedPrompt(
+  startOffsetSec: number,
+  endOffsetSec: number,
+  clipFps: number,
+  parts: BackupPartSpec[],
+): string {
+  return BACKUP_MINUTE_FINDER_SANITIZED_PROMPT.replaceAll('{{WINDOW_START}}', fmtClock(startOffsetSec))
+    .replaceAll('{{WINDOW_END}}', fmtClock(endOffsetSec))
+    .replaceAll('{{CLIP_FPS}}', String(clipFps))
+    .replaceAll('{{PART_MAP}}', buildPartMap(parts))
+}
+
 /** One BACKUP request: concatenated missing-parts clip @ clipFps + one 20-minute
  * movie window (default 1 fps, startOffset/endOffset on the SAME movie upload). */
 export async function runBackupMinuteFinderWindow(
@@ -647,6 +732,7 @@ export async function runBackupMinuteFinderWindow(
   clipFps: number,
   parts: BackupPartSpec[],
   foundSummary: string,
+  customPrompt?: string,
 ): Promise<{ text: string; tokens: number | null }> {
   try {
     const resp = await ai.models.generateContent({
@@ -660,7 +746,7 @@ export async function runBackupMinuteFinderWindow(
               fileData: { fileUri: movieUri, mimeType: 'video/mp4' },
               videoMetadata: { startOffset: `${Math.floor(startOffsetSec)}s`, endOffset: `${Math.ceil(endOffsetSec)}s` },
             },
-            { text: buildBackupMinuteFinderPrompt(startOffsetSec, endOffsetSec, clipFps, parts, foundSummary) },
+            { text: customPrompt || buildBackupMinuteFinderPrompt(startOffsetSec, endOffsetSec, clipFps, parts, foundSummary) },
           ] as never,
         },
       ],

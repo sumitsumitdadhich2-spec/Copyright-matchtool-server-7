@@ -2300,8 +2300,23 @@ class Scheduler {
         // segment ready milta hai, wait zero.
         this.prefetchNextChunks(job, lane)
         let raw: string
+        const alreadySanitized = Boolean(chunk.policyRetried)
+        let effectiveUploadedUri = uploaded.uri
+        const effectivePrompt = alreadySanitized ? CHUNK_MAP_SANITIZED_PROMPT : undefined
+
+        if (alreadySanitized) {
+          const mediaDir = scanMediaDir(scan.id)
+          const sanitizedDir = path.join(mediaDir, 'sanitized')
+          const sanitizedChunkFile = path.join(sanitizedDir, `chunk-${String(chunkIndex).padStart(4, '0')}-muted.mp4`)
+          if (fs.existsSync(sanitizedChunkFile)) {
+            const sanitizedUploaded = await uploadVideo(lane.ai, sanitizedChunkFile, 'video/mp4', `chunk-${chunkIndex}-sanitized`)
+            backupNames.push(sanitizedUploaded.name)
+            effectiveUploadedUri = sanitizedUploaded.uri
+          }
+        }
+
         try {
-          raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+          raw = await mapChunkRequest(lane.ai, m.id, shortUri, effectiveUploadedUri, effectivePrompt)
         } catch (reqErr) {
           const re = classifyError(reqErr)
           const isPolicyBlocked =
@@ -2313,7 +2328,7 @@ class Scheduler {
             addLog(
               scan,
               'warn',
-              `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral Frame Alignment prompt...`,
+              `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${m.id} (key ${lane.idx}) — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral Frame Alignment prompt...`,
             )
             this.mark(job)
 
