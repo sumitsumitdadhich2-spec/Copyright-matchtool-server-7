@@ -381,10 +381,15 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // ---- [1] Movie upload copy (cached while the trim is unchanged) ----
   const copyPath = path.join(mediaDir, 'prescan-movie.mp4')
   const cachedCopy = ctrl.state.movieCopy
+  // An uncompressed direct copy > 350 MB causes Gemini Files API processing to fail (state=FAILED / 500 error).
+  // Invalidate any direct oversized copy so it is cleanly re-encoded to lightweight 480p!
+  const isDirectOversized = Boolean(cachedCopy && !cachedCopy.reencoded && cachedCopy.sizeBytes > 350 * 1024 * 1024)
   let copyValid =
     cachedCopy &&
+    !isDirectOversized &&
     fs.existsSync(copyPath) &&
     fs.statSync(copyPath).size === cachedCopy.sizeBytes &&
+    (cachedCopy.sizeBytes <= 350 * 1024 * 1024 || cachedCopy.reencoded) &&
     Math.abs(cachedCopy.trimStart - trimStart) < 0.01 &&
     Math.abs(cachedCopy.trimEnd - trimEnd) < 0.01
 
@@ -398,7 +403,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       trimStart,
       trimEnd,
     )
-    if (reusedCopy) {
+    if (reusedCopy && (reusedCopy.reencoded || reusedCopy.sizeBytes <= 350 * 1024 * 1024)) {
       ctrl.state.movieCopy = {
         path: copyPath,
         durationSec: reusedCopy.durationSec,
@@ -466,9 +471,11 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const pending = ctrl.queue.length
 
   // ---- [2] Uploads: short + movie copy ----
-  // QUOTA-AWARE KEY SELECTION: Pehle har key ki daily model quota check karo.
-  // Jin keys ke paas chunk models (3.6/3.7/3.8) me quota available hai, unhe select karo.
-  // Jin keys par quota exhausted ho chuki hai, unhe skip karo taaki unpar time/upload waste na ho.
+  // QUOTA-AWARE & PARALLEL SCAN-AWARE KEY SELECTION:
+  // 1. Keys with remaining quota (totalRemaining > 0) strictly FIRST.
+  // 2. Keys with cached uploads for THIS scan first (0s upload wait).
+  // 3. Keys that are NOT busy in other parallel scans first (allows 2-3 scans to partition 16 keys cleanly).
+  // 4. Higher remaining quota.
   const allKeysWithQuota = apiKeys.map((k, i) => {
     const keyId = apiKeyHash(k)
     const availableLanes = CHUNK_MODEL_POOL.filter((m) => getModelUsage(m.id, k) < m.rpd)
@@ -485,6 +492,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
         id,
       ))
     )
+    const isActiveInOtherScan = globalGeminiCoordinator.isKeyActiveInOtherScan(k, id)
     return {
       keyIdx: i + 1,
       apiKey: k,
@@ -493,13 +501,11 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       availableLanesCount: availableLanes.length,
       totalRemaining,
       hasCachedUploads,
+      isActiveInOtherScan,
     }
   })
 
-  // Sort keys:
-  // 1. Keys with remaining quota (totalRemaining > 0) strictly FIRST.
-  // 2. Among keys with quota: keys with cached uploads first (0s upload wait), then higher remaining quota.
-  // 3. Exhausted keys (0 remaining) at the bottom.
+  // Sort keys
   const sortedKeys = [...allKeysWithQuota].sort((a, b) => {
     if ((a.totalRemaining > 0) !== (b.totalRemaining > 0)) {
       return a.totalRemaining > 0 ? -1 : 1
@@ -507,50 +513,49 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     if (a.hasCachedUploads !== b.hasCachedUploads) {
       return a.hasCachedUploads ? -1 : 1
     }
+    if (a.isActiveInOtherScan !== b.isActiveInOtherScan) {
+      return a.isActiveInOtherScan ? 1 : -1
+    }
     return b.totalRemaining - a.totalRemaining
   })
 
-  // Pick keys that have remaining quota (prioritizing cached uploads for 0s wait)
+  // Pick keys that have remaining quota (prioritizing cached uploads & idle keys for parallel scans)
   const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
   const pool = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
-  const neededKeys = Math.max(1, Math.min(3, Math.ceil(total / 2)))
-  const maxKeysForPrescan = Math.min(pool.length, Math.max(1, neededKeys))
-  const selectedKeys = pool.slice(0, maxKeysForPrescan)
+  const targetActiveKeys = Math.min(pool.length, Math.max(2, Math.min(5, Math.ceil(total / 2))))
 
-  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${selectedKeys.length} keys)...` })
-  let uploadedKeys = 0
-  const uploadResults: boolean[] = new Array(selectedKeys.length).fill(false)
-  const UPLOAD_CONCURRENCY = Math.min(4, selectedKeys.length)
+  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${targetActiveKeys} keys)...` })
+  
+  const lanesByKey: typeof pool = []
   let keyCursor = 0
-  const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, selectedKeys.length) }, async () => {
-    while (keyCursor < selectedKeys.length) {
+  const UPLOAD_CONCURRENCY = Math.min(3, pool.length)
+
+  // Worker pool pulls candidate keys from the sorted pool until targetActiveKeys are uploaded
+  // or all candidate keys have been tried. If an upload fails, it seamlessly tries the next key from the pool!
+  const workers = Array.from({ length: UPLOAD_CONCURRENCY }, async () => {
+    while (keyCursor < pool.length && lanesByKey.length < targetActiveKeys) {
       if (ctrl.stopping) return
-      const i = keyCursor++
-      const k = selectedKeys[i]
+      const k = pool[keyCursor++]
+      if (!k) break
       try {
         await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
-        uploadedKeys += 1
-        uploadResults[i] = true
-        persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${selectedKeys.length} keys)...` })
+        lanesByKey.push(k)
+        persist(id, ctrl, { progress: `Uploading to Gemini (${lanesByKey.length}/${targetActiveKeys} keys ready)...` })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        log(id, 'error', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}`)
-        uploadResults[i] = false
+        log(id, 'warn', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}. Trying next available key...`)
       }
     }
   })
   await Promise.all(workers)
   if (ctrl.stopping) return
-  const lanesByKey = selectedKeys.filter((_, i) => uploadResults[i])
   if (lanesByKey.length === 0) {
     throw new Error('Kisi bhi API key par upload nahi hua (short + movie copy) — key/quota check karke Retry karo.')
   }
   log(
     id,
     'success',
-    `Uploads ready on ${lanesByKey.length}/${selectedKeys.length} key(s) (short + movie copy, Files API)${
-      lanesByKey.length < selectedKeys.length ? ` — ${selectedKeys.length - lanesByKey.length} key(s) skipped` : ''
-    }`,
+    `Uploads ready on ${lanesByKey.length} key(s) (short + movie copy, Files API)`,
   )
 
   persist(id, ctrl, { status: 'scanning', progress: `Scanning windows (${total - pending}/${total})` })
@@ -714,14 +719,15 @@ async function ensureUploads(
     log(id, 'info', `Key ${keyIdx}: uploads cached (short + movie copy) — skip`)
     return ctrl.state.uploads[keyId]
   }
-  const [s, m] = await Promise.all([
-    shortOk ? Promise.resolve({ uri: cached!.shortUri, name: cached!.shortName }) : uploadVideo(ai, shortFile),
+  // Upload short first, then movie copy sequentially per key to prevent socket / 500 congestion
+  const s = shortOk ? { uri: cached!.shortUri, name: cached!.shortName } : await uploadVideo(ai, shortFile)
+  const m =
     movieOk && reusedMovie
-      ? Promise.resolve({ uri: reusedMovie.uri, name: reusedMovie.name })
+      ? { uri: reusedMovie.uri, name: reusedMovie.name }
       : movieOk
-        ? Promise.resolve({ uri: cached!.movieUri, name: cached!.movieName })
-        : uploadVideo(ai, copyPath),
-  ])
+        ? { uri: cached!.movieUri, name: cached!.movieName }
+        : await uploadVideo(ai, copyPath)
+
   const up: GeminiPrescanUpload = {
     shortUri: s.uri,
     shortName: s.name,

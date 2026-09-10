@@ -108,6 +108,20 @@ class GlobalGeminiCoordinator {
   }
 
   /**
+   * Check if an API key has any active lanes currently executing in another scan.
+   * Useful for load-balancing parallel scans so that each scan prefers idle keys.
+   */
+  public isKeyActiveInOtherScan(apiKey: string, currentScanId: string): boolean {
+    const hash = apiKeyHash(apiKey)
+    for (const lane of this.lanes.values()) {
+      if (lane.keyHash === hash && lane.activeScanId !== null && lane.activeScanId !== currentScanId) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
    * Acquire an exclusive lock on a (Key × Model × Slot) lane across ALL scans in the entire application.
    * If another scan is using the lane or if the lane is in TPM pacing / 429 cooldown,
    * this will wait and yield gracefully without triggering duplicate requests or 429 collisions.

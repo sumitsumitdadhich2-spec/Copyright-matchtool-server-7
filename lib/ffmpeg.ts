@@ -288,6 +288,13 @@ export async function chunkMovie(
   trimEnd?: number,
   opts: ChunkOptions = {},
 ): Promise<number> {
+  // Support flexible signature in case caller passed (movieFile, outDir, duration, trimStart, trimEnd, onProgress, opts)
+  if (typeof onProgress === 'number' && typeof trimEnd === 'function') {
+    const realProgress = trimEnd as unknown as (pct: number) => void
+    const realStart = onProgress as number
+    const realEnd = typeof trimStart === 'number' ? trimStart : undefined
+    return chunkRange(movieFile, outDir, 'chunk', realStart, realEnd !== undefined && realEnd > realStart ? Math.min(realEnd, duration) : duration, realProgress, opts)
+  }
   const rangeEnd = trimEnd !== undefined && trimEnd > trimStart ? Math.min(trimEnd, duration) : duration
   return chunkRange(movieFile, outDir, 'chunk', trimStart, rangeEnd, onProgress, opts)
 }
@@ -334,7 +341,9 @@ async function chunkRange(
   const peak: { speed: number | null } = { speed: null }
 
   const progress = sliceProgress((doneSec, speed) => {
-    onProgress(Math.min(99, Math.round((doneSec / rangeDur) * 100)))
+    if (typeof onProgress === 'function') {
+      onProgress(Math.min(99, Math.round((doneSec / rangeDur) * 100)))
+    }
     if (speed !== null) peak.speed = Math.max(peak.speed ?? 0, speed)
   })
 
@@ -809,13 +818,21 @@ export async function normalizeForTwelveLabs(sourceFile: string, scanId = 'tl', 
 
 // ---------- Gemini Minute Finder: movie upload copy ----------
 
+/**
+ * Direct upload of source video without re-encode is only safe if file is <= 350 MB.
+ * Raw video files larger than 350 MB (like 1.45 GB) cause Gemini Files API background
+ * transcoding to crash with `state=FAILED` or HTTP 500 INTERNAL server errors.
+ * Re-encoding to 480p / CRF 30 keeps movie copy around ~200-280 MB, ensuring 100% upload and processing reliability.
+ */
+export const PRESCAN_DIRECT_MAX_BYTES = 350 * 1024 * 1024
+
 /** Gemini Files API hard limit is 2 GB per file — stay safely under it. */
 export const PRESCAN_MAX_BYTES = 1.9 * 1024 * 1024 * 1024
 
 /**
  * Build the UPLOAD COPY of the movie for the Gemini Minute Finder. A full-range
- * MP4 (not QuickTime MOV) already in a Gemini-friendly codec and under 1.9 GB
- * is linked/copied directly; trims and incompatible/oversized sources use a precise 480p
+ * MP4 (not QuickTime MOV) already in a Gemini-friendly codec and under 350 MB
+ * is linked/copied directly; trims and sources > 350 MB use a precise 480p
  * / 24 fps / CRF 30 encode. If that result is still > 1.9 GB, the SAME parts
  * are re-joined at 360p / CRF 32 — no second cut.
  */
@@ -835,7 +852,7 @@ export async function preparePrescanMovieCopy(
   const sourceSize = fs.statSync(movieFile).size
   const sourceProfile = await probePrescanMedia(movieFile)
   const fullRange = trimStart <= 0.05 && Math.abs(rangeEnd - movieDuration) <= 0.05
-  const directUploadSafe = sourceSize <= PRESCAN_MAX_BYTES && fullRange && sourceProfile &&
+  const directUploadSafe = sourceSize <= PRESCAN_DIRECT_MAX_BYTES && fullRange && sourceProfile &&
     sourceProfile.format.split(',').includes('mov') && sourceProfile.majorBrand !== undefined && sourceProfile.majorBrand !== 'qt' &&
     ['h264', 'hevc', 'vp9', 'av1'].includes(sourceProfile.videoCodec) &&
     (!sourceProfile.audioCodec || ['aac', 'mp3', 'opus', 'vorbis', 'ac3', 'eac3'].includes(sourceProfile.audioCodec)) &&

@@ -707,13 +707,21 @@ export async function finalizeUploadedMedia(
             }
             return
           }
-          const actual = await chunkMovie(dest, path.join(mediaDir, 'chunks'), duration, 0, duration, (pct) => {
-            const s = getScan(id)
-            if (s) {
-              s.chunkingProgress = pct
-              saveScan(s)
-            }
-          }, { owner: id })
+          const actual = await chunkMovie(
+            dest,
+            path.join(mediaDir, 'chunks'),
+            duration,
+            (pct) => {
+              const s = getScan(id)
+              if (s) {
+                s.chunkingProgress = pct
+                saveScan(s)
+              }
+            },
+            0,
+            duration,
+            { owner: id },
+          )
           const s = getScan(id)
           if (s) {
             s.chunkCount = actual

@@ -158,7 +158,31 @@ export function getClient(apiKey: string): GoogleGenAI {
 
 /** Upload a local video file to the Gemini Files API and wait until it is ACTIVE. */
 export async function uploadVideo(ai: GoogleGenAI, filePath: string): Promise<{ uri: string; name: string }> {
-  const file = await ai.files.upload({ file: filePath, config: { mimeType: 'video/mp4' } })
+  let file: Awaited<ReturnType<typeof ai.files.upload>> | undefined
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      file = await ai.files.upload({ file: filePath, config: { mimeType: 'video/mp4' } })
+      break
+    } catch (err) {
+      lastErr = err
+      const msg = err instanceof Error ? err.message : String(err)
+      if (
+        attempt === 1 &&
+        (msg.includes('500') ||
+          msg.includes('INTERNAL') ||
+          msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('socket'))
+      ) {
+        await new Promise((r) => setTimeout(r, 2000))
+        continue
+      }
+      throw err
+    }
+  }
+  if (!file) throw lastErr || new GeminiError('other', 'Upload failed without response')
+
   let f = file
   const deadline = Date.now() + 5 * 60_000
   // FAST POLLING: check every 2s so the pipeline moves the moment the file is ACTIVE.
@@ -167,7 +191,11 @@ export async function uploadVideo(ai: GoogleGenAI, filePath: string): Promise<{ 
     await new Promise((r) => setTimeout(r, 2000))
     f = await ai.files.get({ name: f.name! })
   }
-  if (f.state !== 'ACTIVE') throw new GeminiError('other', `File upload failed (state=${f.state})`)
+  if (f.state !== 'ACTIVE') {
+    const errObj = (f as { error?: { message?: string; code?: number } }).error
+    const detail = errObj?.message ? ` (${errObj.message})` : ''
+    throw new GeminiError('other', `File upload failed (state=${f.state}${detail})`)
+  }
   return { uri: f.uri!, name: f.name! }
 }
 
