@@ -325,6 +325,8 @@ export async function findAndReusePrescanMovie(
     if (!fs.existsSync(candCopy)) continue
     const size = fs.statSync(candCopy).size
     if (size < 1000) continue
+    // Gemini limit check: do not reuse if copy is larger than 1.95 GB
+    if (size > 1.95 * 1024 * 1024 * 1024) continue
 
     try {
       fs.mkdirSync(path.dirname(targetCopy), { recursive: true })
@@ -341,8 +343,8 @@ export async function findAndReusePrescanMovie(
         }
       }
       const durationSec = cand.geminiPrescan?.movieCopy?.durationSec || (await probeDuration(targetCopy))
-      const reencoded = cand.geminiPrescan?.movieCopy?.reencoded ?? true
-      console.log(`[media] reused 480p prescan movie copy from scan ${cand.id} → ${targetId} (${durationSec.toFixed(1)}s, ${size} bytes)`)
+      const reencoded = cand.geminiPrescan?.movieCopy?.reencoded ?? false
+      console.log(`[media] reused prescan movie copy from scan ${cand.id} → ${targetId} (${durationSec.toFixed(1)}s, ${size} bytes, ${reencoded ? '480p' : 'direct'})`)
       return {
         ok: true,
         copyPath: targetCopy,

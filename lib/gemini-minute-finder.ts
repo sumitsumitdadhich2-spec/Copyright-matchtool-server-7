@@ -381,15 +381,12 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // ---- [1] Movie upload copy (cached while the trim is unchanged) ----
   const copyPath = path.join(mediaDir, 'prescan-movie.mp4')
   const cachedCopy = ctrl.state.movieCopy
-  // An uncompressed direct copy > 350 MB causes Gemini Files API processing to fail (state=FAILED / 500 error).
-  // Invalidate any direct oversized copy so it is cleanly re-encoded to lightweight 480p!
-  const isDirectOversized = Boolean(cachedCopy && !cachedCopy.reencoded && cachedCopy.sizeBytes > 350 * 1024 * 1024)
+  // RULE: Movies <= 2 GB use direct copy / link (reencoded: false), while movies > 2 GB use 480p re-encode.
   let copyValid =
     cachedCopy &&
-    !isDirectOversized &&
     fs.existsSync(copyPath) &&
     fs.statSync(copyPath).size === cachedCopy.sizeBytes &&
-    (cachedCopy.sizeBytes <= 350 * 1024 * 1024 || cachedCopy.reencoded) &&
+    cachedCopy.sizeBytes <= PRESCAN_MAX_BYTES &&
     Math.abs(cachedCopy.trimStart - trimStart) < 0.01 &&
     Math.abs(cachedCopy.trimEnd - trimEnd) < 0.01
 
@@ -403,7 +400,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       trimStart,
       trimEnd,
     )
-    if (reusedCopy && (reusedCopy.reencoded || reusedCopy.sizeBytes <= 350 * 1024 * 1024)) {
+    if (reusedCopy && reusedCopy.sizeBytes <= PRESCAN_MAX_BYTES) {
       ctrl.state.movieCopy = {
         path: copyPath,
         durationSec: reusedCopy.durationSec,
@@ -416,7 +413,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       log(
         id,
         'success',
-        `Re-encoded 480p movie copy pehle se bani hui hai (scan ${reusedCopy.sourceId}) — turant reuse ho gayi (${fmtDur(reusedCopy.durationSec)}, ${fmtMB(reusedCopy.sizeBytes)}), skipping re-encode`,
+        `Movie copy pehle se bani hui hai (scan ${reusedCopy.sourceId}) — turant reuse ho gayi (${fmtDur(reusedCopy.durationSec)}, ${fmtMB(reusedCopy.sizeBytes)}, ${reusedCopy.reencoded ? '480p' : 'direct copy'}), skipping re-encode`,
       )
       copyValid = true
     }
@@ -438,7 +435,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'info',
-      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — compatible full source ho to direct copy, warna precise 480p re-encode`,
+      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — movie > 2 GB ho to 480p re-encode, <= 2 GB ho to direct upload`,
     )
     let lastPct = -1
     const info = await preparePrescanMovieCopy(movieFile, copyPath, movieDuration, trimStart, trimEnd, (pct, note) => {
@@ -452,7 +449,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'success',
-      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p' : 'direct reuse, original quality'})`,
+      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p (> 2 GB source)' : 'direct upload (<= 2 GB source)'})`,
     )
   }
   if (ctrl.stopping) return
@@ -522,28 +519,32 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // Pick keys that have remaining quota (prioritizing cached uploads & idle keys for parallel scans)
   const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
   const pool = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
-  const targetActiveKeys = Math.min(pool.length, Math.max(2, Math.min(5, Math.ceil(total / 2))))
+
+  // STRICT RULE: Upload to at least 3 keys in parallel (if pool has >= 3 keys) so window scan is fast across multiple keys
+  const targetActiveKeys = Math.min(pool.length, Math.max(3, Math.min(6, Math.ceil(total / 2))))
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${targetActiveKeys} keys)...` })
   
   const lanesByKey: typeof pool = []
   let keyCursor = 0
-  const UPLOAD_CONCURRENCY = Math.min(3, pool.length)
+  const UPLOAD_CONCURRENCY = Math.min(targetActiveKeys, 4)
 
   // Worker pool pulls candidate keys from the sorted pool until targetActiveKeys are uploaded
-  // or all candidate keys have been tried. If an upload fails, it seamlessly tries the next key from the pool!
+  // (minimum 3 keys if available). If any key upload fails, it seamlessly tries the next key from the pool!
   const workers = Array.from({ length: UPLOAD_CONCURRENCY }, async () => {
-    while (keyCursor < pool.length && lanesByKey.length < targetActiveKeys) {
+    while (lanesByKey.length < targetActiveKeys && keyCursor < pool.length) {
       if (ctrl.stopping) return
       const k = pool[keyCursor++]
       if (!k) break
       try {
         await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
-        lanesByKey.push(k)
+        if (!lanesByKey.some((existing) => existing.keyId === k.keyId)) {
+          lanesByKey.push(k)
+        }
         persist(id, ctrl, { progress: `Uploading to Gemini (${lanesByKey.length}/${targetActiveKeys} keys ready)...` })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        log(id, 'warn', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}. Trying next available key...`)
+        log(id, 'warn', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}. Pool se agli key try kar rahe hain...`)
       }
     }
   })

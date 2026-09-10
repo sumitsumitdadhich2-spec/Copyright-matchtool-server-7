@@ -113,46 +113,6 @@ export async function probeResolution(file: string): Promise<{ width: number; he
   }
 }
 
-interface PrescanMediaProfile {
-  format: string
-  majorBrand?: string
-  videoCodec: string
-  audioCodec?: string
-  width: number
-  height: number
-  fps: number
-  pixelFormat?: string
-}
-
-/** Read the small set of properties needed to decide whether direct upload is safe. */
-async function probePrescanMedia(file: string): Promise<PrescanMediaProfile | null> {
-  try {
-    const out = await runFfprobe([
-      '-v', 'error', '-show_entries', 'format=format_name:format_tags=major_brand:stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate',
-      '-of', 'json', file,
-    ])
-    const parsed = JSON.parse(out) as { format?: { format_name?: string; tags?: { major_brand?: string } }; streams?: Array<Record<string, unknown>> }
-    const video = parsed.streams?.find((stream) => stream.codec_type === 'video')
-    if (!video || typeof video.codec_name !== 'string' || typeof video.width !== 'number' || typeof video.height !== 'number') return null
-    const audio = parsed.streams?.find((stream) => stream.codec_type === 'audio')
-    const rate = String(video.avg_frame_rate || '')
-    const [n, d] = rate.split('/').map(Number)
-    const fps = d ? n / d : n
-    return {
-      format: String(parsed.format?.format_name || ''),
-      majorBrand: parsed.format?.tags?.major_brand?.trim().toLowerCase(),
-      videoCodec: video.codec_name,
-      audioCodec: typeof audio?.codec_name === 'string' ? audio.codec_name : undefined,
-      width: video.width,
-      height: video.height,
-      fps: Number.isFinite(fps) && fps > 0 ? fps : 0,
-      pixelFormat: typeof video.pix_fmt === 'string' ? video.pix_fmt : undefined,
-    }
-  } catch {
-    return null
-  }
-}
-
 /** Probe the average frame rate of the first video stream (null when unknown). */
 export async function probeFps(file: string): Promise<number | null> {
   try {
@@ -818,23 +778,15 @@ export async function normalizeForTwelveLabs(sourceFile: string, scanId = 'tl', 
 
 // ---------- Gemini Minute Finder: movie upload copy ----------
 
-/**
- * Direct upload of source video without re-encode is only safe if file is <= 350 MB.
- * Raw video files larger than 350 MB (like 1.45 GB) cause Gemini Files API background
- * transcoding to crash with `state=FAILED` or HTTP 500 INTERNAL server errors.
- * Re-encoding to 480p / CRF 30 keeps movie copy around ~200-280 MB, ensuring 100% upload and processing reliability.
- */
-export const PRESCAN_DIRECT_MAX_BYTES = 350 * 1024 * 1024
-
-/** Gemini Files API hard limit is 2 GB per file — stay safely under it. */
-export const PRESCAN_MAX_BYTES = 1.9 * 1024 * 1024 * 1024
+/** Gemini Files API hard limit is 2 GB per file — stay safely under it (1.95 GB). */
+export const PRESCAN_MAX_BYTES = 1.95 * 1024 * 1024 * 1024
 
 /**
- * Build the UPLOAD COPY of the movie for the Gemini Minute Finder. A full-range
- * MP4 (not QuickTime MOV) already in a Gemini-friendly codec and under 350 MB
- * is linked/copied directly; trims and sources > 350 MB use a precise 480p
- * / 24 fps / CRF 30 encode. If that result is still > 1.9 GB, the SAME parts
- * are re-joined at 360p / CRF 32 — no second cut.
+ * Build the UPLOAD COPY of the movie for the Gemini Minute Finder.
+ * RULE: Re-encoding to 480p / 24fps / CRF 30 is ONLY performed if the movie file is > 2 GB
+ * (or if a non-streamable trim range is required).
+ * Movies <= 2 GB (such as 1.45 GB, 1.48 GB, etc.) are directly linked or stream-copied without
+ * re-encoding so that processing is instantaneous and takes 0 extra seconds!
  */
 export async function preparePrescanMovieCopy(
   movieFile: string,
@@ -850,18 +802,13 @@ export async function preparePrescanMovieCopy(
   const scanId = opts.scanId || path.basename(path.dirname(outFile))
   const stage = 'prescan-copy'
   const sourceSize = fs.statSync(movieFile).size
-  const sourceProfile = await probePrescanMedia(movieFile)
   const fullRange = trimStart <= 0.05 && Math.abs(rangeEnd - movieDuration) <= 0.05
-  const directUploadSafe = sourceSize <= PRESCAN_DIRECT_MAX_BYTES && fullRange && sourceProfile &&
-    sourceProfile.format.split(',').includes('mov') && sourceProfile.majorBrand !== undefined && sourceProfile.majorBrand !== 'qt' &&
-    ['h264', 'hevc', 'vp9', 'av1'].includes(sourceProfile.videoCodec) &&
-    (!sourceProfile.audioCodec || ['aac', 'mp3', 'opus', 'vorbis', 'ac3', 'eac3'].includes(sourceProfile.audioCodec)) &&
-    sourceProfile.fps > 0 && sourceProfile.fps <= 60
 
-  if (sourceProfile && directUploadSafe) {
+  // CASE 1: Full-range movie <= 2 GB -> Instant direct hardlink / copy without re-encoding!
+  if (sourceSize <= PRESCAN_MAX_BYTES && fullRange) {
     await fs.promises.mkdir(path.dirname(outFile), { recursive: true })
     await fs.promises.rm(outFile, { force: true })
-    onProgress(0, 'Source already Gemini-compatible — skipping re-encode')
+    onProgress(0, 'Source <= 2 GB — direct reuse (no re-encode)')
     let reuseMode = 'hard link'
     try {
       await fs.promises.link(movieFile, outFile)
@@ -869,17 +816,50 @@ export async function preparePrescanMovieCopy(
       reuseMode = 'async copy'
       await fs.promises.copyFile(movieFile, outFile)
     }
-    opts.onLog?.(`ffmpeg: prescan source compatible (${sourceProfile.videoCodec}/${sourceProfile.audioCodec || 'no audio'}, ${sourceProfile.width}x${sourceProfile.height}, ${sourceProfile.fps.toFixed(2)} fps) — ${reuseMode}`)
+    const durationSec = (await probeDuration(outFile)) || movieDuration
+    opts.onLog?.(`ffmpeg: prescan movie <= 2 GB (${(sourceSize / (1024 * 1024)).toFixed(1)} MB) — skipping re-encode, using ${reuseMode}`)
     onProgress(100, `Movie copy ready (${reuseMode})`)
-    return { durationSec: await probeDuration(outFile), sizeBytes: sourceSize, reencoded: false }
+    return { durationSec, sizeBytes: sourceSize, reencoded: false }
   }
+
+  // CASE 2: Trimmed movie <= 2 GB -> Try fast stream copy (-c copy) without re-encoding!
+  if (sourceSize <= PRESCAN_MAX_BYTES && !fullRange) {
+    try {
+      await fs.promises.mkdir(path.dirname(outFile), { recursive: true })
+      await fs.promises.rm(outFile, { force: true })
+      onProgress(0, 'Fast stream copy for trim (no re-encode)...')
+      await runFfmpeg([
+        '-ss', String(trimStart),
+        '-to', String(rangeEnd),
+        '-i', movieFile,
+        '-c', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        '-y',
+        outFile,
+      ])
+      const sz = fs.statSync(outFile).size
+      if (sz > 0 && sz <= PRESCAN_MAX_BYTES) {
+        opts.onLog?.(`ffmpeg: prescan trim stream copy successful (${(sz / (1024 * 1024)).toFixed(1)} MB)`)
+        onProgress(100, 'Movie trim copy ready (stream copy)')
+        const durationSec = (await probeDuration(outFile)) || rangeDur
+        return { durationSec, sizeBytes: sz, reencoded: false }
+      }
+    } catch (err) {
+      opts.onLog?.(`ffmpeg: trim stream copy failed, falling back to 480p re-encode: ${err}`)
+    }
+  }
+
+  // CASE 3: Movie is > 2 GB (exceeds Gemini limit) -> Re-encode to 480p / CRF 30 to shrink under 2 GB
+  await fs.promises.mkdir(path.dirname(outFile), { recursive: true })
+  await fs.promises.rm(outFile, { force: true })
 
   const src = await probeResolution(movieFile)
   const ar = src ? src.width / src.height : 16 / 9
   const w480 = even(Math.round(480 * ar))
   const w360 = even(Math.round(360 * ar))
 
-  onProgress(0, 'Precise re-encode (480p, all cores)...')
+  onProgress(0, 'Movie > 2 GB: 480p re-encode (all cores)...')
+  opts.onLog?.(`ffmpeg: movie size (${(sourceSize / (1024 * 1024)).toFixed(1)} MB) > 2 GB — 480p CRF 30 parallel sliceEncode`)
   try {
     const { parts } = await sliceEncode({
       source: movieFile,
@@ -901,8 +881,8 @@ export async function preparePrescanMovieCopy(
       label: 'Minute Finder movie copy',
     })
     if (fs.statSync(outFile).size > PRESCAN_MAX_BYTES) {
-      onProgress(70, 'Still > 1.9 GB — re-joining smaller copy (360p)...')
-      opts.onLog?.('ffmpeg: prescan copy > 1.9 GB → re-join parts at 360p / CRF 32')
+      onProgress(70, 'Still > 1.95 GB — re-joining smaller copy (360p)...')
+      opts.onLog?.('ffmpeg: prescan copy > 1.95 GB → re-join parts at 360p / CRF 32')
       fs.rmSync(outFile, { force: true })
       await joinParts(
         parts,
@@ -913,7 +893,7 @@ export async function preparePrescanMovieCopy(
       )
       if (fs.statSync(outFile).size > PRESCAN_MAX_BYTES) {
         fs.rmSync(outFile, { force: true })
-        throw new Error('Movie copy 360p par bhi 1.9 GB se badi hai — chhota trim range use karo.')
+        throw new Error('Movie copy 360p par bhi 2 GB se badi hai — chhota trim range use karo.')
       }
     }
   } finally {

@@ -201,10 +201,12 @@ async function reuseFromScan(req: Request, id: string, kind: MediaKind, name: st
   const fresh = getScan(id)
   if (fresh) {
     if (kind === 'movie') {
-      // Proactively link prescan-movie.mp4 if source scan already has it
+      // Proactively link prescan-movie.mp4 ONLY if source scan copy was re-encoded (never uncompressed stream copies)
+      const srcScan = getScan(sourceId)
+      const isReencoded = srcScan?.geminiPrescan?.movieCopy?.reencoded === true
       const srcPrescan = path.join(scanMediaDir(sourceId), 'prescan-movie.mp4')
       const dstPrescan = path.join(scanMediaDir(id), 'prescan-movie.mp4')
-      if (fs.existsSync(srcPrescan) && fs.statSync(srcPrescan).size > 1000 && !fs.existsSync(dstPrescan)) {
+      if (isReencoded && fs.existsSync(srcPrescan) && fs.statSync(srcPrescan).size > 1000 && !fs.existsSync(dstPrescan)) {
         try {
           fs.linkSync(srcPrescan, dstPrescan)
         } catch {
