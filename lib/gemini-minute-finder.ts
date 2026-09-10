@@ -995,7 +995,11 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
           }
         }
         sendResult = await sendWindow(ctrl, lane, w, pass, alreadyPolicyRetried)
+        incrementModelUsage(lane.model.id, lane.apiKey)
       } catch (reqErr) {
+        // Count the incoming attempt against lane key quota
+        incrementModelUsage(lane.model.id, lane.apiKey)
+
         const re = classifyError(reqErr)
         const isPolicyBlocked =
           re.kind === 'policy_blocked' ||
@@ -1017,19 +1021,24 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
             await ensureSanitizedBackupClipUpload(id, ctrl, lane, clipPath)
           }
 
-          sendResult = await sendWindow(ctrl, lane, w, pass, true)
-          log(
-            id,
-            'success',
-            `${tag} #${w.index}: Sanitized retry succeeded after policy flag bypass (${sendResult.parsed.hits.length} hit(s)) on ${lane.label}`,
-          )
+          try {
+            sendResult = await sendWindow(ctrl, lane, w, pass, true)
+            incrementModelUsage(lane.model.id, lane.apiKey)
+            log(
+              id,
+              'success',
+              `${tag} #${w.index}: Sanitized retry succeeded after policy flag bypass (${sendResult.parsed.hits.length} hit(s)) on ${lane.label}`,
+            )
+          } catch (retryErr) {
+            incrementModelUsage(lane.model.id, lane.apiKey)
+            throw retryErr
+          }
         } else {
           throw reqErr
         }
       }
 
       const { text, tokens, parsed } = sendResult
-      incrementModelUsage(lane.model.id, lane.apiKey)
 
       // Parse sanity: no hits AND no recognizable HISSA 3 / NOT FOUND => retry.
       const recognizable =

@@ -14,7 +14,7 @@ import {
 import { CHUNK_MODEL_POOL, VERIFY_MODEL_POOL } from './models'
 import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
-import { addLog, getScan, saveScan, scanMediaDir } from './store'
+import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import type { ChunkMatch, MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, MissingSceneWindowHit, Scan } from './types'
@@ -341,7 +341,9 @@ PART <n>: NOT FOUND — not in this 20-minute window`
             ],
           })
           text = resp.text || ''
+          incrementModelUsage(selected.modelId, selected.apiKey)
         } catch (reqErr) {
+          incrementModelUsage(selected.modelId, selected.apiKey)
           const re = classifyError(reqErr)
           const isPolicyBlocked =
             re.kind === 'policy_blocked' ||
@@ -372,24 +374,30 @@ PART <number> MATCH: Movie Minute <N> (around <mm:ss> - <mm:ss>)
 If not found, report:
 PART <number>: NOT FOUND`
 
-            const sanitizedResp = await runnerAi.models.generateContent({
-              model: selected.modelId,
-              contents: [
-                {
-                  role: 'user',
-                  parts: [
-                    { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                    {
-                      fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
-                      videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
-                    },
-                    { text: sanitizedWindowPrompt },
-                  ],
-                },
-              ],
-            })
-            text = sanitizedResp.text || ''
-            addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
+            try {
+              const sanitizedResp = await runnerAi.models.generateContent({
+                model: selected.modelId,
+                contents: [
+                  {
+                    role: 'user',
+                    parts: [
+                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                      {
+                        fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
+                        videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
+                      },
+                      { text: sanitizedWindowPrompt },
+                    ],
+                  },
+                ],
+              })
+              text = sanitizedResp.text || ''
+              incrementModelUsage(selected.modelId, selected.apiKey)
+              addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
+            } catch (retryErr) {
+              incrementModelUsage(selected.modelId, selected.apiKey)
+              throw retryErr
+            }
           } else {
             throw reqErr
           }
@@ -554,7 +562,9 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               ],
             })
             cText = resp.text || ''
+            incrementModelUsage(selected.modelId, selected.apiKey)
           } catch (reqErr) {
+            incrementModelUsage(selected.modelId, selected.apiKey)
             const re = classifyError(reqErr)
             const isPolicyBlocked =
               re.kind === 'policy_blocked' ||
@@ -578,21 +588,27 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               const sanitizedUp = await uploadVideo(runnerAi, sanitizedChunkFile, `Missing Chunk ${chunkIdx + 1} Sanitized`)
               uploadedFilesToClean.push(sanitizedUp.name)
 
-              const sanitizedResp = await runnerAi.models.generateContent({
-                model: selected.modelId,
-                contents: [
-                  {
-                    role: 'user',
-                    parts: [
-                      { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                      { text: CHUNK_MAP_SANITIZED_PROMPT },
-                    ],
-                  },
-                ],
-              })
-              cText = sanitizedResp.text || ''
-              addLog(scan, 'success', `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Sanitized retry succeeded after policy flag bypass`)
+              try {
+                const sanitizedResp = await runnerAi.models.generateContent({
+                  model: selected.modelId,
+                  contents: [
+                    {
+                      role: 'user',
+                      parts: [
+                        { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                        { text: CHUNK_MAP_SANITIZED_PROMPT },
+                      ],
+                    },
+                  ],
+                })
+                cText = sanitizedResp.text || ''
+                incrementModelUsage(selected.modelId, selected.apiKey)
+                addLog(scan, 'success', `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Sanitized retry succeeded after policy flag bypass`)
+              } catch (retryErr) {
+                incrementModelUsage(selected.modelId, selected.apiKey)
+                throw retryErr
+              }
             } else {
               throw reqErr
             }

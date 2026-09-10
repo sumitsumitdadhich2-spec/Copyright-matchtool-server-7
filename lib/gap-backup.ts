@@ -406,8 +406,21 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
           } catch (err) {
             const e = err instanceof GeminiError ? err : classifyError(err)
             item.attempts = (item.attempts || 0) + 1
+            const isPolicyBlocked =
+              e.kind === 'policy_blocked' ||
+              /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(e.message)
 
-            if (item.attempts >= 7) {
+            if (isPolicyBlocked) {
+              incrementModelUsage(lane.model.id, lane.key)
+              request.status = 'failed'
+              request.error = 'Flagged by Google Policy (PROHIBITED_CONTENT) — stopped to protect quota'
+              request.finishedAt = Date.now()
+              log(
+                scan,
+                'warn',
+                `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${lane.model.id} (key ${lane.keyIndex + 1}) — automatic retries stopped to protect API keys quota; moving to next chunk`,
+              )
+            } else if (item.attempts >= 7) {
               request.status = 'failed'
               request.error = e.message.slice(0, 500)
               request.finishedAt = Date.now()

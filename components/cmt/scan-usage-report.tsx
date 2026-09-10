@@ -80,8 +80,8 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
         </div>
       </div>
 
-      {/* Top 3 Metric Cards: Real Work vs High Demand/429 vs 404 */}
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+      {/* Top 4 Metric Cards: Real Work vs Policy Handled vs High Demand/429 vs 404 */}
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {/* Effective Real Work */}
         <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3.5 shadow-sm">
           <div className="flex items-center justify-between">
@@ -100,6 +100,27 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
             In requests ne output generate kiya aur API key se billable tokens / quota deduct hua.
+          </p>
+        </div>
+
+        {/* Prohibited Policy Handled & Retried */}
+        <div className="rounded-xl border border-purple-500/30 bg-purple-500/10 p-3.5 shadow-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold uppercase tracking-wider text-purple-400">
+              Policy Handled & Retried
+            </span>
+            <span className="flex size-6 items-center justify-center rounded-full bg-purple-500/20 text-purple-300">
+              <ShieldAlert className="size-3.5" />
+            </span>
+          </div>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className="font-mono text-2xl font-bold text-purple-400">
+              {errorBreakdown.prohibitedPolicy}
+            </span>
+            <span className="text-xs font-medium text-purple-300/80">policy requests (incl. retry)</span>
+          </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+            Google policy par 1 audio-strip sanitized retry hua. Quota bachaane ke liye 1 baar ke baad turant stop hua.
           </p>
         </div>
 
@@ -169,6 +190,16 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
               </p>
               <p className="mt-0.5 text-foreground/90">
                 Jab Google Gemini server <strong>HTTP 200 OK</strong> ke sath pura response complete karta hai (Input tokens + Output response tokens). Chahe scene match mile ya na mile, agar model ne visual analysis complete ki to quota use hota hai.
+              </p>
+            </div>
+
+            <div className="rounded-md bg-background/80 p-2.5 border border-border/50">
+              <p className="font-semibold text-purple-400 flex items-center gap-1">
+                <ShieldAlert className="size-3" />
+                Google Prohibited Content Policy &amp; Sanitized Retry System
+              </p>
+              <p className="mt-0.5 text-foreground/90 leading-relaxed">
+                Jab kisi chunk ya clip me audio/visual safety policy (PROHIBITED_CONTENT) trigger hoti hai, to Google safety filter ke under attempt count hoti hai. Humara system turant clip ka audio strip (-an mute) karke neutral visual forensic prompt ke sath <strong>EXACTLY 1 sanitized retry</strong> karta hai. Dono requests (initial aur retry) key quota aur is audit report me accurately count hoti hain. Agar retry bhi block hoti hai, to <strong>automatic retry turant ruk jaati hai</strong> taaki aapka API keys quota protect rahe aur loop na bane.
               </p>
             </div>
 
@@ -274,6 +305,7 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
               <tr className="border-b border-border/80 bg-muted/60 text-muted-foreground font-medium">
                 <th className="px-3 py-2">Model</th>
                 <th className="px-2 py-2 text-center text-emerald-400">Effective (Kaam Hua)</th>
+                <th className="px-2 py-2 text-center text-purple-400">Policy Blocked &amp; Retried</th>
                 <th className="px-2 py-2 text-center text-amber-400">High Demand / 429</th>
                 <th className="px-2 py-2 text-center text-muted-foreground">404 / Limits</th>
                 <th className="px-2 py-2 text-center">Chunk</th>
@@ -305,6 +337,9 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
                     <td className="px-2 py-2 text-center font-bold text-emerald-400 bg-emerald-500/5">
                       {data.effective || '0'}
                     </td>
+                    <td className="px-2 py-2 text-center font-medium text-purple-400 bg-purple-500/5">
+                      {data.errors.prohibitedPolicy || '—'}
+                    </td>
                     <td className="px-2 py-2 text-center font-medium text-amber-400">
                       {data.errors.highDemandOrRateLimit || '—'}
                     </td>
@@ -325,6 +360,9 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
                 <td className="px-3 py-2">Grand Total</td>
                 <td className="px-2 py-2 text-center font-mono text-emerald-400 font-bold bg-emerald-500/10">
                   {effectiveRequests}
+                </td>
+                <td className="px-2 py-2 text-center font-mono text-purple-400 font-bold bg-purple-500/10">
+                  {errorBreakdown.prohibitedPolicy || '0'}
                 </td>
                 <td className="px-2 py-2 text-center font-mono text-amber-400">
                   {errorBreakdown.highDemandOrRateLimit}

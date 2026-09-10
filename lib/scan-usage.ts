@@ -186,18 +186,36 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       }
 
       if (isError) {
-        const modelMatch = msg.match(/(gemini-[\w.-]+)/i)
+        let modelMatch = msg.match(/(gemini-[\w.-]+)/i)
         let stage: keyof ScanUsageSummary['byStage'] = 'chunkScan'
         if (lower.includes('rescan')) stage = 'rescan'
         else if (lower.includes('verifier') || lower.includes('verify')) stage = 'verifier'
         else if (lower.includes('missing-scene') || lower.includes('missing scene')) stage = 'missingScene'
         else if (lower.includes('window') || lower.includes('minute finder') || lower.includes('prescan')) stage = 'minuteFinder'
 
+        // If log message lacks model name, deduce it from chunk index
+        if (!modelMatch && stage === 'chunkScan') {
+          const cNumMatch = msg.match(/Chunk\s+(\d+)/i)
+          if (cNumMatch) {
+            const cIdx = parseInt(cNumMatch[1], 10)
+            const matchedChunk =
+              scan.chunks?.find((c) => c.index === cIdx) ||
+              scan.shortSegments?.flatMap((s) => s.chunks || []).find((c) => c.index === cIdx)
+            if (matchedChunk?.model) {
+              modelMatch = [matchedChunk.model, matchedChunk.model]
+            }
+          }
+        }
+
         const defaultModelForStage =
           stage === 'verifier' ? 'gemini-3.5-flash-lite' : stage === 'rescan' ? 'gemini-3-flash-preview' : 'gemini-3.7-flash'
         const rawModel = normalizeModelName(modelMatch ? modelMatch[1] : defaultModelForStage)
 
-        const key = `err-${timeKey}-${rawModel}-${msg.slice(0, 40)}`
+        // Differentiate retry vs initial policy hits so they are never deduped away
+        const isRetryPolicy = lower.includes('after sanitized retry')
+        const isInitialPolicy = lower.includes('triggering 1 sanitized retry')
+        const policyPhase = isRetryPolicy ? '-retry' : isInitialPolicy ? '-initial' : ''
+        const key = `err-${timeKey}-${rawModel}${policyPhase}-${msg.slice(0, 75)}`
         if (!loggedErrors.has(key)) {
           loggedErrors.add(key)
           recordRequest(rawModel, stage, false, errorCategory)
@@ -275,14 +293,22 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         recordRequest(model, 'minuteFinder', true)
       }
     }
-    // Prohibited policy retries on minute finder windows
+    // Prohibited policy retries on minute finder windows (both initial hit and retry hit if failed)
     for (const w of scan.geminiPrescan.windows) {
       if (w.policyRetried) {
-        const key = `struct-win-policy-${w.index}`
-        if (!loggedErrors.has(key)) {
-          loggedErrors.add(key)
-          const laneModel = w.lane?.split('·')[1]?.trim()
-          recordRequest(normalizeModelName(laneModel || 'gemini-3.7-flash'), 'minuteFinder', false, 'prohibitedPolicy')
+        const laneModel = w.lane?.split('·')[1]?.trim()
+        const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
+        const key1 = `struct-win-policy-initial-${w.index}-${model}`
+        if (!loggedErrors.has(key1)) {
+          loggedErrors.add(key1)
+          recordRequest(model, 'minuteFinder', false, 'prohibitedPolicy')
+        }
+        if (w.status === 'failed') {
+          const key2 = `struct-win-policy-retry-${w.index}-${model}`
+          if (!loggedErrors.has(key2)) {
+            loggedErrors.add(key2)
+            recordRequest(model, 'minuteFinder', false, 'prohibitedPolicy')
+          }
         }
       }
     }
@@ -302,11 +328,19 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     }
     for (const w of scan.geminiPrescan.backup.windows) {
       if (w.policyRetried) {
-        const key = `struct-bwin-policy-${w.index}`
-        if (!loggedErrors.has(key)) {
-          loggedErrors.add(key)
-          const laneModel = w.lane?.split('·')[1]?.trim()
-          recordRequest(normalizeModelName(laneModel || 'gemini-3.7-flash'), 'minuteFinder', false, 'prohibitedPolicy')
+        const laneModel = w.lane?.split('·')[1]?.trim()
+        const model = normalizeModelName(laneModel || 'gemini-3.7-flash')
+        const key1 = `struct-bwin-policy-initial-${w.index}-${model}`
+        if (!loggedErrors.has(key1)) {
+          loggedErrors.add(key1)
+          recordRequest(model, 'minuteFinder', false, 'prohibitedPolicy')
+        }
+        if (w.status === 'failed') {
+          const key2 = `struct-bwin-policy-retry-${w.index}-${model}`
+          if (!loggedErrors.has(key2)) {
+            loggedErrors.add(key2)
+            recordRequest(model, 'minuteFinder', false, 'prohibitedPolicy')
+          }
         }
       }
     }
@@ -326,13 +360,21 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     }
   }
 
-  // Chunk policy retries
+  // Chunk policy retries: count initial attempt, and if status is policy_blocked, count retry attempt too
   for (const c of chunkList) {
     if (c.policyRetried) {
-      const key = `struct-chunk-policy-${c.index}`
-      if (!loggedErrors.has(key)) {
-        loggedErrors.add(key)
-        recordRequest(normalizeModelName(c.model || 'gemini-3.7-flash'), 'chunkScan', false, 'prohibitedPolicy')
+      const model = normalizeModelName(c.model || 'gemini-3.7-flash')
+      const key1 = `struct-chunk-policy-initial-${c.index}-${model}`
+      if (!loggedErrors.has(key1)) {
+        loggedErrors.add(key1)
+        recordRequest(model, 'chunkScan', false, 'prohibitedPolicy')
+      }
+      if (c.status === 'policy_blocked') {
+        const key2 = `struct-chunk-policy-retry-${c.index}-${model}`
+        if (!loggedErrors.has(key2)) {
+          loggedErrors.add(key2)
+          recordRequest(model, 'chunkScan', false, 'prohibitedPolicy')
+        }
       }
     }
   }

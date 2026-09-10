@@ -278,6 +278,22 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('rpd', msg)
   }
 
+  if (
+    lower.includes('prohibited_content') ||
+    lower.includes('blocked_by_safety') ||
+    lower.includes('safety_ratings_blocked') ||
+    lower.includes('block_reason: prohibited_content') ||
+    lower.includes('prompt block reason: prohibited_content') ||
+    lower.includes('finishreason=safety') ||
+    lower.includes('finish reason: safety') ||
+    lower.includes('finish reason: blocklist') ||
+    lower.includes('finish reason: prohibited_content') ||
+    lower.includes('harm_category') ||
+    (lower.includes('safety') && lower.includes('ratings'))
+  ) {
+    return new GeminiError('policy_blocked', msg)
+  }
+
   // All other 429s, resource_exhausted, quota exceeded, per-minute, TPM, RPM, pacing are TEMPORARY rate limits
   const is429 =
     lower.includes('429') ||
@@ -293,20 +309,6 @@ export function classifyError(err: unknown): GeminiError {
 
   if (is429) {
     return new GeminiError('rate', msg)
-  }
-
-  if (
-    lower.includes('prohibited_content') ||
-    lower.includes('blocked_by_safety') ||
-    lower.includes('safety_ratings_blocked') ||
-    lower.includes('block_reason: prohibited_content') ||
-    lower.includes('prompt block reason: prohibited_content') ||
-    lower.includes('finishreason=safety') ||
-    lower.includes('finish reason: safety') ||
-    lower.includes('finish reason: blocklist') ||
-    lower.includes('finish reason: prohibited_content')
-  ) {
-    return new GeminiError('policy_blocked', msg)
   }
 
   if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {

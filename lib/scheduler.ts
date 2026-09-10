@@ -1684,18 +1684,27 @@ class Scheduler {
       if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
       st.state = 'active'
       job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
-      const rawRes = await fn()
-      st.usedToday = incrementModelUsage(m.id, lane.apiKey)
-      this.mark(job)
-      return rawRes
-    } catch (err) {
-      const e = err instanceof GeminiError ? err : classifyError(err)
-      if (e.kind === 'rate') {
-        globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
-      } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
-        globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot)
+      try {
+        const rawRes = await fn()
+        st.usedToday = incrementModelUsage(m.id, lane.apiKey)
+        this.mark(job)
+        return rawRes
+      } catch (err) {
+        const e = err instanceof GeminiError ? err : classifyError(err)
+        if (
+          e.kind === 'policy_blocked' ||
+          /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(e.message)
+        ) {
+          st.usedToday = incrementModelUsage(m.id, lane.apiKey)
+          this.mark(job)
+        }
+        if (e.kind === 'rate') {
+          globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
+        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot)
+        }
+        throw err
       }
-      throw err
     } finally {
       if (releaseGlobalLock) releaseGlobalLock(videoSeconds)
     }
@@ -2295,6 +2304,8 @@ class Scheduler {
         job.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
 
         addLog(scan, 'info', `${minutePrefix}Chunk ${chunkIndex}: mapping short → movie minute ${chunkIndex} on ${m.id} (key ${lane.idx})`)
+        chunk.model = m.id
+        chunk.keyIdx = lane.idx
         // PIPELINING: while Gemini analyzes THIS chunk, the next chunk's
         // cut + upload runs in the background — analysis khatam hote hi agla
         // segment ready milta hai, wait zero.
@@ -2302,6 +2313,7 @@ class Scheduler {
         let raw: string
         const alreadySanitized = Boolean(chunk.policyRetried)
         let effectiveUploadedUri = uploaded.uri
+        let effectiveShortUri = shortUri
         const effectivePrompt = alreadySanitized ? CHUNK_MAP_SANITIZED_PROMPT : undefined
 
         if (alreadySanitized) {
@@ -2313,11 +2325,28 @@ class Scheduler {
             backupNames.push(sanitizedUploaded.name)
             effectiveUploadedUri = sanitizedUploaded.uri
           }
+          const sanitizedShortFile = path.join(sanitizedDir, `short-${String(seg.index + 1).padStart(4, '0')}-muted.mp4`)
+          if (fs.existsSync(sanitizedShortFile)) {
+            const sanitizedShortUp = await uploadVideo(lane.ai, sanitizedShortFile, 'video/mp4', `short-${seg.index + 1}-sanitized`)
+            backupNames.push(sanitizedShortUp.name)
+            effectiveShortUri = sanitizedShortUp.uri
+          }
         }
 
         try {
-          raw = await mapChunkRequest(lane.ai, m.id, shortUri, effectiveUploadedUri, effectivePrompt)
+          // Request Attempt 1: Call Gemini
+          raw = await mapChunkRequest(lane.ai, m.id, effectiveShortUri, effectiveUploadedUri, effectivePrompt)
+          const used = incrementModelUsage(m.id, lane.apiKey)
+          st.usedToday = used
+          chunk.requestCount = (chunk.requestCount || 0) + 1
+          this.mark(job)
         } catch (reqErr) {
+          // Count Attempt 1 towards key quota since Google processed the incoming request
+          const used1 = incrementModelUsage(m.id, lane.apiKey)
+          st.usedToday = used1
+          chunk.requestCount = (chunk.requestCount || 0) + 1
+          this.mark(job)
+
           const re = classifyError(reqErr)
           const isPolicyBlocked =
             re.kind === 'policy_blocked' ||
@@ -2335,6 +2364,7 @@ class Scheduler {
             // Prepare sanitized muted chunk video
             const mediaDir = scanMediaDir(scan.id)
             const sanitizedDir = path.join(mediaDir, 'sanitized')
+            fs.mkdirSync(sanitizedDir, { recursive: true })
             const originalChunkFile = chunkPath(path.join(mediaDir, 'chunks'), chunkIndex)
             const sanitizedChunkFile = path.join(sanitizedDir, `chunk-${String(chunkIndex).padStart(4, '0')}-muted.mp4`)
 
@@ -2346,9 +2376,38 @@ class Scheduler {
             const sanitizedUploaded = await uploadVideo(lane.ai, fileToUpload, 'video/mp4', `chunk-${chunkIndex}-sanitized`)
             backupNames.push(sanitizedUploaded.name)
 
-            // Request with sanitized muted chunk and neutral prompt
-            raw = await mapChunkRequest(lane.ai, m.id, shortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
-            addLog(scan, 'success', `${minutePrefix}Chunk ${chunkIndex}: Sanitized retry succeeded after policy flag bypass`)
+            // Prepare sanitized muted short video to remove audio triggers from short clip as well
+            let sanitizedShortUri = shortUri
+            try {
+              const originalShortFile = await this.ensureSegmentFile(scan, seg)
+              const sanitizedShortFile = path.join(sanitizedDir, `short-${String(seg.index + 1).padStart(4, '0')}-muted.mp4`)
+              if (!fs.existsSync(sanitizedShortFile) && fs.existsSync(originalShortFile)) {
+                await sanitizeVideoMute(originalShortFile, sanitizedShortFile)
+              }
+              if (fs.existsSync(sanitizedShortFile)) {
+                const sanitizedShortUp = await uploadVideo(lane.ai, sanitizedShortFile, 'video/mp4', `short-${seg.index + 1}-sanitized`)
+                backupNames.push(sanitizedShortUp.name)
+                sanitizedShortUri = sanitizedShortUp.uri
+              }
+            } catch (muteErr) {
+              console.warn(`Could not sanitize short segment audio: ${muteErr}`)
+            }
+
+            // Request Attempt 2: Sanitized Retry with neutral prompt
+            try {
+              raw = await mapChunkRequest(lane.ai, m.id, sanitizedShortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
+              const usedRetry = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = usedRetry
+              chunk.requestCount = (chunk.requestCount || 0) + 1
+              addLog(scan, 'success', `${minutePrefix}Chunk ${chunkIndex}: Sanitized retry succeeded on ${m.id} (key ${lane.idx}) after policy flag bypass`)
+              this.mark(job)
+            } catch (retryErr) {
+              const usedRetry = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = usedRetry
+              chunk.requestCount = (chunk.requestCount || 0) + 1
+              this.mark(job)
+              throw retryErr
+            }
           } else {
             // RATE LIMIT (429): do NOT retry immediately with zero wait on the same key!
             // Throw immediately so it enters cooldown and is re-queued for another key.
@@ -2361,13 +2420,21 @@ class Scheduler {
             addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: Gemini model server busy (503/overload) on ${m.id} (key ${lane.idx}) — retrying in 2s...`)
             this.mark(job)
             await sleep(2000)
-            raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+            try {
+              raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+              const usedRetry = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = usedRetry
+              chunk.requestCount = (chunk.requestCount || 0) + 1
+              this.mark(job)
+            } catch (retry503Err) {
+              const usedRetry = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = usedRetry
+              chunk.requestCount = (chunk.requestCount || 0) + 1
+              this.mark(job)
+              throw retry503Err
+            }
           }
         }
-
-        const used = incrementModelUsage(m.id, lane.apiKey)
-        st.usedToday = used
-        this.mark(job)
 
         this.recordChunkOutput(chunk, m.id, raw)
 
@@ -2456,7 +2523,7 @@ class Scheduler {
           addLog(
             scan,
             'warn',
-            `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) after sanitized retry — automatic retries stopped to protect API keys quota; moving to next chunk`,
+            `${minutePrefix}Chunk ${chunkIndex}: Flagged by Google Policy (PROHIBITED_CONTENT) after sanitized retry on ${m.id} (key ${lane.idx}) — automatic retries stopped to protect API keys quota; moving to next chunk`,
           )
         } else if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
           chunk.status = 'failed'

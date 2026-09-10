@@ -65,6 +65,10 @@ export interface ChunkState {
   qualityRetries?: number
   /** whether this chunk had an automatic audio-stripped sanitized retry after a policy block */
   policyRetried?: boolean
+  /** which API key index processed this chunk */
+  keyIdx?: number
+  /** total actual API requests made to Gemini for this chunk (including sanitized retries) */
+  requestCount?: number
   /** full raw Gemini outputs produced for this chunk, oldest first */
   rawOutputs?: ChunkRawOutput[]
   /** cancelled by the EARLY-STOP system (all matches found + fast-confirmed) —
