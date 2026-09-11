@@ -5,7 +5,8 @@ import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
 import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
-import { preparePrescanMovieCopy, buildBackupClip, sanitizeVideoMute } from './ffmpeg'
+import { preparePrescanMovieCopy, buildBackupClip, sanitizeVideoMute, PRESCAN_MAX_BYTES, chunkPath } from './ffmpeg'
+import { poolSnapshot } from './ffmpeg-pool'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, type ModelSpec } from './models'
 import {
   getClient,
@@ -1489,24 +1490,54 @@ function buildSuggestions(state: GeminiPrescanState, trimStart: number, trimEnd:
   return [...byMinute.values()].sort((a, b) => a.minute - b.minute)
 }
 
-/** The chunk scan needs movie chunks — wait for the trim route's background chunking. */
+/** The chunk scan needs movie chunks — wait for the background chunking to finish. Checks every 1s and verifies worker pool status. */
 async function waitForChunking(id: string, ctrl: Ctrl): Promise<void> {
   const deadline = Date.now() + CHUNKING_WAIT_MS
   let noted = false
+  const chunksDir = path.join(scanMediaDir(id), 'chunks')
+
   while (Date.now() < deadline) {
     if (ctrl.stopping) return
     const s = getScan(id)
     if (!s) throw new Error('Scan missing')
     if (s.status === 'error') throw new Error(s.error || 'Chunking failed')
-    if (s.chunkCount > 0 && s.status !== 'chunking' && (s.chunkingProgress ?? 100) >= 100) return
+
+    const pool = poolSnapshot()
+    const scanChunkingJobs = pool.jobs.filter((j) => j.owner === id || j.label.includes(id))
+    const isChunkingStatus = s.status === 'chunking' || (s.chunkingProgress ?? 100) < 100
+    const isShortSegmenting = (s.shortSegments && s.shortSegments.length > 1) && ((s.shortSegmentingProgress ?? 100) < 100)
+
+    const neededMinutes = ctrl.state.appliedMinutes || []
+    const allNeededChunksOnDisk = neededMinutes.length === 0
+      ? (s.chunkCount > 0 && fs.existsSync(chunksDir))
+      : neededMinutes.every((m) => {
+          const p = chunkPath(chunksDir, m)
+          return fs.existsSync(p) && fs.statSync(p).size > 1000
+        })
+
+    if (!isChunkingStatus && !isShortSegmenting && scanChunkingJobs.length === 0 && allNeededChunksOnDisk && s.chunkCount > 0) {
+      if (noted) {
+        log(id, 'success', `Movie chunks cutting complete (${s.chunkCount} chunks) & CPU workers free — chunk scan shuru ho raha hai!`)
+      }
+      return
+    }
+
+    const workerStatus = pool.active > 0 ? `${pool.active}/${pool.engines} worker(s) active` : 'workers idle'
+    const progressText = `Minutes ready — waiting for chunks (${s.chunkingProgress ?? 0}% · ${workerStatus})...`
+
     if (!noted) {
       noted = true
-      persist(id, ctrl, { progress: `Minutes ready — waiting for movie chunking (${s.chunkingProgress ?? 0}%)...` })
-      log(id, 'info', 'Minute list ready — movie chunking abhi chal rahi hai, complete hote hi chunk scan start hoga')
+      persist(id, ctrl, { progress: progressText })
+      log(
+        id,
+        'info',
+        `Minute list ready — movie chunks abhi background me cut ho rahe hain (${s.chunkingProgress ?? 0}%, ${workerStatus}). Workers free aur chunks ready hote hi chunk scan turant start hoga (checked every 1s).`,
+      )
     } else {
-      persist(id, ctrl, { progress: `Minutes ready — waiting for movie chunking (${s.chunkingProgress ?? 0}%)...` })
+      persist(id, ctrl, { progress: progressText })
     }
-    await sleep(2000)
+
+    await sleep(1000)
   }
   throw new Error('Movie chunking complete nahi hui — chunking finish hone par Start dabao (minute ranges already apply ho chuke hain, scan sirf unhi par chalega)')
 }
