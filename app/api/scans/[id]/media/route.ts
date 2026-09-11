@@ -29,9 +29,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   if (!file) {
     file = await ensureLocalMedia(id, kind)
   }
-  if (!file || !fs.existsSync(file)) return new Response('File not found', { status: 404 })
+  if (!file || !fs.existsSync(/*turbopackIgnore: true*/ file)) return new Response('File not found', { status: 404 })
 
-  const stat = fs.statSync(file)
+  const stat = fs.statSync(/*turbopackIgnore: true*/ file)
   const etag = `"${stat.size}-${Math.floor(stat.mtimeMs)}"`
   const lastModified = stat.mtime.toUTCString()
 
@@ -73,7 +73,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         : Math.min(start + maxChunk - 1, stat.size - 1)
 
       const contentLength = end - start + 1
-      const stream = fs.createReadStream(file, { start, end })
+      const stream = fs.createReadStream(/*turbopackIgnore: true*/ file, { start, end })
 
       return new Response(Readable.toWeb(stream) as ReadableStream, {
         status: 206,
@@ -90,7 +90,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
     }
   }
 
-  const stream = fs.createReadStream(file)
+  const stream = fs.createReadStream(/*turbopackIgnore: true*/ file)
   return new Response(Readable.toWeb(stream) as ReadableStream, {
     status: 200,
     headers: {

@@ -91,21 +91,25 @@ export async function PUT(req: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+  const results: Record<string, unknown> = { ok: true }
   if (body.autoMode !== undefined) {
     const enabled = Boolean(body.autoMode)
     await setUserAutoMode(session.username, enabled)
-    return NextResponse.json({ ok: true, autoMode: enabled })
+    results.autoMode = enabled
   }
   if (body.verifierEnabled !== undefined) {
     const enabled = Boolean(body.verifierEnabled)
     await setUserVerifierEnabled(session.username, enabled)
-    return NextResponse.json({ ok: true, verifierEnabled: enabled })
+    results.verifierEnabled = enabled
   }
-  if (!isMinuteFinderMode(body.minuteFinder)) {
-    return NextResponse.json({ error: 'minuteFinder must be gemini | twelvelabs | off' }, { status: 400 })
+  if (body.minuteFinder !== undefined) {
+    if (!isMinuteFinderMode(body.minuteFinder)) {
+      return NextResponse.json({ error: 'minuteFinder must be gemini | twelvelabs | off' }, { status: 400 })
+    }
+    await setUserMinuteFinderMode(session.username, body.minuteFinder)
+    results.minuteFinder = body.minuteFinder
   }
-  await setUserMinuteFinderMode(session.username, body.minuteFinder)
-  return NextResponse.json({ ok: true, minuteFinder: body.minuteFinder })
+  return NextResponse.json(results)
 }
 
 export async function PATCH(req: Request) {

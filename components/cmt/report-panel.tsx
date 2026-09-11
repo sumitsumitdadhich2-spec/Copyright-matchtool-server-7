@@ -694,8 +694,10 @@ function CandidateDetailCard({
           <div className="space-y-1">
             <video
               ref={videoRef}
-              src={`/api/scans/${scan.id}/media?kind=movie`}
+              src={`/api/scans/${scan.id}/media?kind=movie&preview=1`}
               controls
+              preload="metadata"
+              playsInline
               className="w-full rounded-md bg-black max-h-64 shadow-md"
               aria-label={`Movie preview at ${fmtTime(previewStart)}`}
             />
@@ -758,8 +760,10 @@ function SingleFallbackCandidateCard({ scan, match: m }: { scan: Scan; match: Ch
         {showVideo ? (
           <video
             ref={videoRef}
-            src={`/api/scans/${scan.id}/media?kind=movie`}
+            src={`/api/scans/${scan.id}/media?kind=movie&preview=1`}
             controls
+            preload="metadata"
+            playsInline
             className="w-full rounded-md bg-black max-h-64 shadow-md"
             aria-label={`Movie preview at ${fmtTime(m.movieStart)}`}
           />

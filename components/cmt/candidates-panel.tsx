@@ -222,6 +222,7 @@ function CandidateRow({ scan, g, c, index }: { scan: Scan; g: CandidateGroup; c:
           ref={videoRef}
           src={`/api/scans/${scan.id}/media?kind=movie&preview=1`}
           preload="metadata"
+          playsInline
           controls
           className="mt-2 w-full rounded-md bg-black max-h-60"
           aria-label={`Movie preview at ${fmtTime(previewStart)}`}

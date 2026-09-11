@@ -61,8 +61,9 @@ export async function ensureLocalMedia(id: string, kind: MediaKind, force = fals
 const previewEncoding = new Set<string>()
 
 function triggerBackgroundPreviewEncode(scanId: string, inputPath: string, outputPath: string) {
-  if (previewEncoding.has(scanId)) return
-  previewEncoding.add(scanId)
+  const encKey = `${scanId}:${path.basename(outputPath)}`
+  if (previewEncoding.has(encKey)) return
+  previewEncoding.add(encKey)
 
   void (async () => {
     try {
@@ -95,7 +96,7 @@ function triggerBackgroundPreviewEncode(scanId: string, inputPath: string, outpu
     } catch (err) {
       console.warn(`[media] background preview encode skipped for scan ${scanId}:`, err instanceof Error ? err.message : err)
     } finally {
-      previewEncoding.delete(scanId)
+      previewEncoding.delete(encKey)
     }
   })()
 }
@@ -146,8 +147,8 @@ export async function ensureLocalPreviewMedia(id: string, kind: MediaKind): Prom
 
     // 4. Fallback to original movie.mp4 (which will stream smoothly with 16MB chunks)
     const original = await ensureLocalMedia(id, 'movie')
-    if (original && fs.existsSync(original)) {
-      const stat = fs.statSync(original)
+    if (original && fs.existsSync(/*turbopackIgnore: true*/ original)) {
+      const stat = fs.statSync(/*turbopackIgnore: true*/ original)
       if (stat.size > 150 * 1024 * 1024) {
         triggerBackgroundPreviewEncode(id, original, previewCopy)
       }
@@ -157,11 +158,18 @@ export async function ensureLocalPreviewMedia(id: string, kind: MediaKind): Prom
 
   // kind === 'short'
   const previewShort = path.join(dir, 'preview-short.mp4')
-  if (fs.existsSync(/*turbopackIgnore: true*/ previewShort) && fs.statSync(previewShort).size > 1000) {
+  if (fs.existsSync(/*turbopackIgnore: true*/ previewShort) && fs.statSync(/*turbopackIgnore: true*/ previewShort).size > 1000) {
     return previewShort
   }
 
-  return ensureLocalMedia(id, 'short')
+  const shortFile = await ensureLocalMedia(id, 'short')
+  if (shortFile && fs.existsSync(/*turbopackIgnore: true*/ shortFile)) {
+    const stat = fs.statSync(/*turbopackIgnore: true*/ shortFile)
+    if (stat.size > 50 * 1024 * 1024) {
+      triggerBackgroundPreviewEncode(id, shortFile, previewShort)
+    }
+  }
+  return shortFile
 }
 
 // ---------- Local → S3 mirror ----------
