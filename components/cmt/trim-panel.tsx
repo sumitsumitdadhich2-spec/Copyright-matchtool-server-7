@@ -188,7 +188,7 @@ export function TrimPanel({ scan, refresh }: { scan: Scan; refresh: () => void }
 
       <video
         ref={videoRef}
-        src={`/api/scans/${scan.id}/media?kind=movie`}
+        src={`/api/scans/${scan.id}/media?kind=movie&preview=1`}
         controls
         preload="metadata"
         playsInline

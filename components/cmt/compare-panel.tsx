@@ -9,14 +9,11 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  FastForward,
-  ListFilter,
   Loader2,
   Pause,
   Play,
   RefreshCw,
   RotateCcw,
-  Search,
   Sparkles,
   SplitSquareHorizontal,
   Terminal,
@@ -54,11 +51,8 @@ interface ToastNotification {
   id: string
   title: string
   msg: string
-  shortStart: number
-  shortEnd: number
   pairIndex: number
   taskKey: string
-  status: 'success' | 'error'
 }
 
 function playRescanChime() {
@@ -94,12 +88,20 @@ function playRescanChime() {
   } catch {}
 }
 
-/** Side-by-side preview of matched windows with:
- *  - Non-blocking background rescan with clickable completion notification & jump back
- *  - Direct scene jump (type scene #, e.g. 61, or pick from searchable list)
- *  - Autoplay continuous playback mode with pause-anywhere capability
- *  - Buttery smooth video playback with micro-drift sync & DOM-ref progress tracking
- */
+/** Side-by-side preview of matched windows: each parsed "Short X --> Movie Y" line
+ *  is one pair with (near-)equal durations on both sides.
+ *
+ *  CANDIDATES: when the short window of a pair has alternative movie windows
+ *  (other candidates of its group — confirmed, unverified, rejected or not yet
+ *  checked), extra Prev/Next-candidate buttons appear. Browsing swaps ONLY the
+ *  movie side so the user compares each candidate against the same short clip,
+ *  and "Make this the main clip" turns that candidate into the pair used by the
+ *  stitched preview and the export.
+ *
+ *  RESCAN / RETRY: Users can click the Retry / Rescan button to hunt for this exact
+ *  short segment in the full chunk. The newly found rescan match immediately becomes
+ *  the MAIN clip (with the previous match stored in candidates), marked with Rescan
+ *  branding for user review. */
 export function ComparePanel({ scan }: { scan: Scan }) {
   const { mutate } = useSWRConfig()
   const pairs = useMemo(() => {
@@ -127,7 +129,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       return (b.confidence || 0) - (a.confidence || 0)
     })
 
-    // 2. Build non-overlapping pairs list.
+    // 2. Build non-overlapping pairs list. If two matches represent the same short segment
+    // or overlap significantly, KEEP ONLY THE BEST ONE as the main match entry!
+    // The alternative candidate remains accessible in the Candidate Chooser below.
     const out: ChunkMatch[] = []
     for (const m of sorted) {
       const conflictIndex = out.findIndex((existing) =>
@@ -161,19 +165,14 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     out.sort((a, b) => a.shortStart - b.shortStart)
     return out
   }, [scan.matches])
-
   const [idx, setIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
-  const [autoplay, setAutoplay] = useState(false)
-  const [playbackRate, setPlaybackRate] = useState<number>(1)
+  // null = the pair's own movie window; a number = options[candIdx] on the movie side
   const [candIdx, setCandIdx] = useState<number | null>(null)
+  const [shortProgress, setShortProgress] = useState(0)
+  const [movieProgress, setMovieProgress] = useState(0)
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [showConsole, setShowConsole] = useState(true)
-
-  // Direct Jump controls
-  const [jumpInput, setJumpInput] = useState(() => '1')
-  const [showSceneList, setShowSceneList] = useState(false)
-  const [sceneSearch, setSceneSearch] = useState('')
 
   // Persistent rescan task tracking keyed by `${shortStart.toFixed(1)}-${shortEnd.toFixed(1)}`
   const [rescanTasks, setRescanTasks] = useState<Record<string, RescanTaskState>>({})
@@ -181,15 +180,8 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
   const shortRef = useRef<HTMLVideoElement>(null)
   const movieRef = useRef<HTMLVideoElement>(null)
-  const shortBarRef = useRef<HTMLDivElement>(null)
-  const movieBarRef = useRef<HTMLDivElement>(null)
   const animFrameRef = useRef<number | null>(null)
   const isSeekingRef = useRef(false)
-  const autoplayRef = useRef(false)
-  autoplayRef.current = autoplay
-  const playbackRateRef = useRef(1)
-  playbackRateRef.current = playbackRate
-  const pendingAutoPlayRef = useRef(false)
 
   const pair = pairs[Math.min(idx, Math.max(0, pairs.length - 1))]
   const pairShortStart = pair?.shortStart ?? 0
@@ -224,11 +216,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     }
   }, [idx, pairs.length])
 
-  // Sync jump input with current idx
-  useEffect(() => {
-    setJumpInput(String(idx + 1))
-  }, [idx])
-
   // Leaving a pair always returns to its main window.
   useEffect(() => {
     setCandIdx(null)
@@ -238,44 +225,20 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const safeSeek = useCallback((video: HTMLVideoElement | null, targetTime: number) => {
     if (!video) return
     try {
+      video.pause()
       if (Number.isFinite(targetTime) && targetTime >= 0) {
-        video.currentTime = targetTime
+        if (video.readyState >= 1) {
+          video.currentTime = targetTime
+        } else {
+          const onMeta = () => {
+            try {
+              video.currentTime = targetTime
+            } catch {}
+          }
+          video.addEventListener('loadedmetadata', onMeta, { once: true })
+        }
       }
     } catch {}
-  }, [])
-
-  // Start synchronized playback
-  const startPlayback = useCallback(() => {
-    const sv = shortRef.current
-    const mv = movieRef.current
-    if (!sv || !mv || !pair) return
-
-    // Re-align to start if either has reached the end or is out of bounds
-    if (sv.currentTime >= shortEnd - 0.05 || sv.currentTime < shortStart) {
-      sv.currentTime = shortStart
-    }
-    if (mv.currentTime >= movieEnd - 0.05 || mv.currentTime < movieStart) {
-      mv.currentTime = movieStart
-    }
-
-    sv.playbackRate = playbackRateRef.current
-    mv.playbackRate = playbackRateRef.current
-
-    const p1 = sv.play().catch(() => {})
-    const p2 = mv.play().catch(() => {})
-    void Promise.all([p1, p2]).then(() => {
-      setPlaying(true)
-    })
-  }, [pair, shortStart, shortEnd, movieStart, movieEnd])
-
-  // Pause playback cleanly and stop autoplay
-  const pauseBoth = useCallback(() => {
-    const sv = shortRef.current
-    const mv = movieRef.current
-    if (sv) sv.pause()
-    if (mv) mv.pause()
-    setPlaying(false)
-    pendingAutoPlayRef.current = false
   }, [])
 
   // Seek both players to window start whenever shown windows change
@@ -291,22 +254,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     const mv = movieRef.current
     safeSeek(sv, shortStart)
     safeSeek(mv, movieStart)
-    if (shortBarRef.current) shortBarRef.current.style.width = '0%'
-    if (movieBarRef.current) movieBarRef.current.style.width = '0%'
-
-    if (pendingAutoPlayRef.current && autoplayRef.current) {
-      pendingAutoPlayRef.current = false
-      const timer = setTimeout(() => {
-        startPlayback()
-      }, 120)
-      return () => clearTimeout(timer)
-    } else {
-      setPlaying(false)
-    }
+    setShortProgress(0)
+    setMovieProgress(0)
+    setPlaying(false)
     isSeekingRef.current = false
-  }, [pair, pairShortStart, movieStart, candIdx, safeSeek, shortStart, startPlayback])
+  }, [pair, pairShortStart, movieStart, candIdx, safeSeek, shortStart])
 
-  // High-frequency synchronized frame loop during playback (No React state re-render = 60fps smooth)
+  // High-frequency synchronized frame loop during playback
   useEffect(() => {
     if (!playing || !pair) {
       if (animFrameRef.current) {
@@ -322,7 +276,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
       const sv = shortRef.current
       const mv = movieRef.current
-      const baseSpeed = playbackRateRef.current
 
       let shortEnded = false
       let movieEnded = false
@@ -330,10 +283,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       if (sv) {
         const cur = sv.currentTime
         const rel = Math.max(0, cur - shortStart)
-        const pct = Math.min(100, (rel / shortDur) * 100)
-        if (shortBarRef.current) {
-          shortBarRef.current.style.width = `${pct}%`
-        }
+        setShortProgress(Math.min(100, (rel / shortDur) * 100))
 
         if (cur >= shortEnd - 0.03 || cur < shortStart - 0.2) {
           sv.pause()
@@ -347,10 +297,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       if (mv) {
         const cur = mv.currentTime
         const rel = Math.max(0, cur - movieStart)
-        const pct = Math.min(100, (rel / movieDur) * 100)
-        if (movieBarRef.current) {
-          movieBarRef.current.style.width = `${pct}%`
-        }
+        setMovieProgress(Math.min(100, (rel / movieDur) * 100))
 
         if (cur >= movieEnd - 0.03 || cur < movieStart - 0.2) {
           mv.pause()
@@ -361,32 +308,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         movieEnded = true
       }
 
-      // Micro-drift correction without choppy seeks
-      if (sv && mv && !sv.paused && !mv.paused && !shortEnded && !movieEnded) {
-        const relShort = (sv.currentTime - shortStart) / shortDur
-        const relMovie = (mv.currentTime - movieStart) / movieDur
-        const drift = relShort - relMovie
-
-        if (drift > 0.06) {
-          mv.playbackRate = baseSpeed * 1.08
-          sv.playbackRate = baseSpeed * 0.94
-        } else if (drift < -0.06) {
-          sv.playbackRate = baseSpeed * 1.08
-          mv.playbackRate = baseSpeed * 0.94
-        } else {
-          if (sv.playbackRate !== baseSpeed) sv.playbackRate = baseSpeed
-          if (mv.playbackRate !== baseSpeed) mv.playbackRate = baseSpeed
-        }
-      }
-
-      // When BOTH videos have reached their respective cuts:
+      // When BOTH videos have reached their respective cuts, stop playback cleanly!
       if (shortEnded && movieEnded) {
-        if (autoplayRef.current) {
-          pendingAutoPlayRef.current = true
-          setIdx((cur) => (cur + 1) % pairs.length)
-        } else {
-          setPlaying(false)
-        }
+        setPlaying(false)
         return
       }
 
@@ -402,33 +326,33 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         animFrameRef.current = null
       }
     }
-  }, [playing, pair, shortStart, shortEnd, movieStart, movieEnd, shortDur, movieDur, pairs.length])
+  }, [playing, pair, shortStart, shortEnd, movieStart, movieEnd, shortDur, movieDur])
 
   const togglePlay = useCallback(() => {
+    const sv = shortRef.current
+    const mv = movieRef.current
+    if (!sv || !mv || !pair) return
+
     if (playing) {
-      pauseBoth()
-      if (autoplay) setAutoplay(false)
+      sv.pause()
+      mv.pause()
+      setPlaying(false)
     } else {
-      startPlayback()
-    }
-  }, [playing, autoplay, pauseBoth, startPlayback])
+      // Re-align to start if either has reached the end
+      if (sv.currentTime >= shortEnd - 0.05 || sv.currentTime < shortStart) {
+        sv.currentTime = shortStart
+      }
+      if (mv.currentTime >= movieEnd - 0.05 || mv.currentTime < movieStart) {
+        mv.currentTime = movieStart
+      }
 
-  const toggleAutoplay = useCallback(() => {
-    if (autoplay) {
-      setAutoplay(false)
-      pauseBoth()
-    } else {
-      setAutoplay(true)
-      startPlayback()
+      const p1 = sv.play().catch(() => {})
+      const p2 = mv.play().catch(() => {})
+      void Promise.all([p1, p2]).then(() => {
+        setPlaying(true)
+      })
     }
-  }, [autoplay, pauseBoth, startPlayback])
-
-  const changePlaybackRate = useCallback((speed: number) => {
-    setPlaybackRate(speed)
-    playbackRateRef.current = speed
-    if (shortRef.current) shortRef.current.playbackRate = speed
-    if (movieRef.current) movieRef.current.playbackRate = speed
-  }, [])
+  }, [playing, pair, shortStart, shortEnd, movieStart, movieEnd])
 
   const restart = useCallback(() => {
     const sv = shortRef.current
@@ -441,8 +365,8 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       mv.pause()
       mv.currentTime = movieStart
     }
-    if (shortBarRef.current) shortBarRef.current.style.width = '0%'
-    if (movieBarRef.current) movieBarRef.current.style.width = '0%'
+    setShortProgress(0)
+    setMovieProgress(0)
     setPlaying(false)
   }, [shortStart, movieStart])
 
@@ -451,41 +375,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     if (pairs.length <= 1) return
     setIdx((cur) => (cur + delta + pairs.length) % pairs.length)
   }, [pairs.length])
-
-  // Direct Jump application handler
-  const applyJump = useCallback((val: string) => {
-    const num = parseInt(val.trim(), 10)
-    if (!isNaN(num) && pairs.length > 0) {
-      const clamped = Math.max(0, Math.min(pairs.length - 1, num - 1))
-      setIdx(clamped)
-      setJumpInput(String(clamped + 1))
-      setShowSceneList(false)
-    } else {
-      setJumpInput(String(idx + 1))
-    }
-  }, [pairs.length, idx])
-
-  // Filtered scenes for the jump-to popover
-  const filteredScenes = useMemo(() => {
-    if (!sceneSearch.trim()) return pairs.map((p, i) => ({ pair: p, index: i }))
-    const q = sceneSearch.toLowerCase().trim()
-    return pairs
-      .map((p, i) => ({ pair: p, index: i }))
-      .filter(({ pair: p, index: i }) => {
-        const numStr = String(i + 1)
-        const shortStr = `${fmtTime(p.shortStart)} ${fmtTime(p.shortEnd)}`
-        const movieStr = `${fmtTime(p.movieStart)} ${fmtTime(p.movieEnd)}`
-        const chunkStr = `chunk ${p.chunkIndex}`
-        const statusStr = p.batchVerified || (p.viaRescan ? 'rescan' : '')
-        return (
-          numStr.includes(q) ||
-          shortStr.includes(q) ||
-          movieStr.includes(q) ||
-          chunkStr.includes(q) ||
-          statusStr.includes(q)
-        )
-      })
-  }, [pairs, sceneSearch])
 
   // Current scene task key
   const currentTaskKey = pair ? `${pair.shortStart.toFixed(1)}-${pair.shortEnd.toFixed(1)}` : ''
@@ -496,38 +385,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     currentTask?.status === 'scanning' ||
     currentTask?.status === 'retrying'
 
-  // All active background rescans
-  const activeBackgroundTasks = useMemo(() => {
-    return Object.values(rescanTasks).filter(
-      (t) =>
-        t.status === 'preparing' ||
-        t.status === 'uploading' ||
-        t.status === 'scanning' ||
-        t.status === 'retrying',
-    )
-  }, [rescanTasks])
-
-  // Jump to specific short segment scene
-  const jumpToShortSegment = useCallback(
-    (tShortStart: number, tShortEnd: number) => {
-      const targetIdx = pairs.findIndex((p) =>
-        sameShortSegment(p.shortStart, p.shortEnd, tShortStart, tShortEnd),
-      )
-      if (targetIdx !== -1) {
-        setIdx(targetIdx)
-      }
-    },
-    [pairs],
-  )
-
-  // Jump to scene from toast notification
-  const jumpToToastScene = useCallback(() => {
-    if (!toastNotification) return
-    jumpToShortSegment(toastNotification.shortStart, toastNotification.shortEnd)
-    setToastNotification(null)
-  }, [toastNotification, jumpToShortSegment])
-
-  // Targeted Rescan / Retry handler with Non-blocking execution
+  // Targeted Rescan / Retry handler with Gemini Model choice (3.6, 3.7, 3.8) & 4x Auto Retry
   async function handleRescanScene(chosenModel?: string) {
     if (!pair) return
     setShowModelPicker(false)
@@ -576,9 +434,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       })
     }
 
-    appendLog(
-      `[Rescan Init] Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} | Movie chunk ${activeChunk + 1} | Model: ${chosenModel ? displayModelName(chosenModel) : 'Auto (First Available)'}`,
-    )
+    appendLog(`[Rescan Init] Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} | Movie chunk ${activeChunk + 1} | Model: ${chosenModel ? displayModelName(chosenModel) : 'Auto (First Available)'}`)
 
     for (let attempt = 1; attempt <= 4; attempt++) {
       setRescanTasks((prev) => {
@@ -672,11 +528,8 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             id: `toast-${Date.now()}`,
             title: '✨ Rescan Successful!',
             msg: `Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} → Movie ${fmtTime(data.movieStart)}–${fmtTime(data.movieEnd)} (${displayModelName(data.model)})`,
-            shortStart: targetShortStart,
-            shortEnd: targetShortEnd,
             pairIndex,
             taskKey,
-            status: 'success',
           })
 
           setCandIdx(null)
@@ -709,17 +562,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               errorMsg: data.error || 'No match found in chunk',
             },
           }))
-
-          setToastNotification({
-            id: `toast-${Date.now()}`,
-            title: '⚠️ Rescan Finished: No Match',
-            msg: `Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)}: ${data.error || 'No match found in chunk'}`,
-            shortStart: targetShortStart,
-            shortEnd: targetShortEnd,
-            pairIndex,
-            taskKey,
-            status: 'error',
-          })
           return
         }
       } catch {
@@ -737,24 +579,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               errorMsg: 'Network error after 4 attempts',
             },
           }))
-
-          setToastNotification({
-            id: `toast-${Date.now()}`,
-            title: '❌ Rescan Network Error',
-            msg: `Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)}: Network error after 4 attempts`,
-            shortStart: targetShortStart,
-            shortEnd: targetShortEnd,
-            pairIndex,
-            taskKey,
-            status: 'error',
-          })
           return
         }
       }
     }
   }
 
-  // Keyboard navigation for lightning-fast review
+  // Keyboard navigation for smooth review
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement
@@ -769,25 +600,19 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       } else if (e.key === ' ' && !e.repeat) {
         e.preventDefault()
         togglePlay()
-      } else if (e.key.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault()
-        toggleAutoplay()
       } else if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault()
         restart()
-      } else if (e.key === 'Escape') {
-        setShowSceneList(false)
-        setShowModelPicker(false)
       }
     }
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleCycleMatch, togglePlay, toggleAutoplay, restart])
+  }, [handleCycleMatch, togglePlay, restart])
 
   if (!pair) return null
 
-  const src = (kind: 'short' | 'movie') => `/api/scans/${scan.id}/media?kind=${kind}`
+  const src = (kind: 'short' | 'movie') => `/api/scans/${scan.id}/media?kind=${kind}&preview=1`
 
   return (
     <section aria-label="Side-by-side comparison" className="panel relative">
@@ -812,23 +637,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             <RotateCcw className="size-3 animate-spin-slow" aria-hidden />
             🔄 Rescanned (User Review)
           </span>
-        )}
-
-        {/* Active Background Rescan Pill */}
-        {activeBackgroundTasks.length > 0 && (
-          <button
-            type="button"
-            onClick={() => jumpToShortSegment(activeBackgroundTasks[0].shortStart, activeBackgroundTasks[0].shortEnd)}
-            className="flex items-center gap-1.5 rounded-full border border-indigo-500/50 bg-indigo-500/15 px-2.5 py-0.5 font-mono text-xs font-semibold text-indigo-300 animate-pulse hover:bg-indigo-500/25 transition-colors cursor-pointer"
-            title="Click to jump to active background rescan"
-          >
-            <RefreshCw className="size-3 animate-spin text-indigo-400" />
-            <span>
-              {activeBackgroundTasks.length === 1
-                ? `Rescanning Short ${fmtTime(activeBackgroundTasks[0].shortStart)} (Attempt ${activeBackgroundTasks[0].attempt}/4)`
-                : `${activeBackgroundTasks.length} Rescans running in background...`}
-            </span>
-          </button>
         )}
 
         {/* Batch Verifier Verdict Badge */}
@@ -862,197 +670,33 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           </span>
         )}
 
-        {/* Fast Navigation & Direct Scene Jump Bar */}
-        <div className="ml-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
-          {/* Prev Button (Never blocked by background rescan!) */}
+        {/* Fast Navigation Buttons */}
+        <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           <button
             type="button"
             onClick={() => handleCycleMatch(-1)}
-            disabled={pairs.length <= 1}
-            className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40 cursor-pointer"
+            disabled={pairs.length <= 1 || isCurrentRescanning}
+            className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40"
             title="Previous match (← Left Arrow)"
           >
             <ChevronLeft className="size-3.5" aria-hidden /> Prev
           </button>
-
-          {/* Direct Scene Jump Input */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              applyJump(jumpInput)
-            }}
-            className="flex items-center gap-1 bg-secondary/50 rounded-md px-1.5 py-0.5 border border-border/50"
-          >
-            <span className="text-[11px] font-medium text-muted-foreground select-none">Scene</span>
-            <input
-              type="number"
-              min={1}
-              max={pairs.length}
-              value={jumpInput}
-              onChange={(e) => setJumpInput(e.target.value)}
-              onBlur={() => applyJump(jumpInput)}
-              className="w-12 rounded border border-input bg-card px-1 py-0.5 text-center font-mono text-xs font-bold text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
-              title="Type scene number (e.g. 61) and press Enter to jump directly"
-            />
-            <span className="font-mono text-xs text-muted-foreground select-none">/ {pairs.length}</span>
-          </form>
-
-          {/* Next Button (Never blocked by background rescan!) */}
+          <span className="font-mono text-[11px] text-muted-foreground select-none">
+            {idx + 1}/{pairs.length}
+          </span>
           <button
             type="button"
             onClick={() => handleCycleMatch(1)}
-            disabled={pairs.length <= 1}
-            className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40 cursor-pointer"
+            disabled={pairs.length <= 1 || isCurrentRescanning}
+            className="flex items-center gap-1 rounded-md border border-input bg-card px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary active:scale-95 disabled:opacity-40"
             title="Next match (→ Right Arrow)"
           >
             Next <ChevronRight className="size-3.5" aria-hidden />
           </button>
-
-          {/* Jump to Scene Popover Dropdown */}
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setShowSceneList((prev) => !prev)}
-              className={`flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer ${
-                showSceneList
-                  ? 'border-primary bg-primary/10 text-primary'
-                  : 'border-input bg-card text-muted-foreground hover:bg-secondary hover:text-foreground'
-              }`}
-              title="Browse and jump directly to any scene"
-            >
-              <ListFilter className="size-3.5" aria-hidden />
-              <span>Jump ▾</span>
-            </button>
-
-            {/* Popover Menu */}
-            {showSceneList && (
-              <div className="absolute right-0 top-full mt-1.5 w-84 max-w-[90vw] rounded-xl border border-border bg-card/98 p-2.5 shadow-2xl backdrop-blur-md z-50 animate-in fade-in zoom-in-95">
-                <div className="flex items-center justify-between border-b border-border/50 pb-2 mb-2">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-                    <ListFilter className="size-4 text-primary" />
-                    <span>Jump to Any Scene</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setShowSceneList(false)}
-                    className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
-                  >
-                    ✕
-                  </button>
-                </div>
-
-                {/* Search input */}
-                <div className="relative mb-2">
-                  <Search className="absolute left-2.5 top-2 size-3.5 text-muted-foreground" />
-                  <input
-                    type="text"
-                    value={sceneSearch}
-                    onChange={(e) => setSceneSearch(e.target.value)}
-                    placeholder="Filter scene # or timestamp (e.g. 61, 04:12)..."
-                    className="w-full rounded-md border border-input bg-background/80 py-1.5 pl-8 pr-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
-                    autoFocus
-                  />
-                </div>
-
-                {/* Fast shortcuts */}
-                <div className="flex items-center justify-between gap-1 mb-2">
-                  <button
-                    type="button"
-                    onClick={() => applyJump('1')}
-                    className="flex-1 rounded bg-secondary/80 py-1 text-[10px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors cursor-pointer text-center"
-                  >
-                    First (#1)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyJump(String(Math.max(1, idx + 1 - 10)))}
-                    className="flex-1 rounded bg-secondary/80 py-1 text-[10px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors cursor-pointer text-center"
-                  >
-                    -10 Scenes
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyJump(String(Math.min(pairs.length, idx + 1 + 10)))}
-                    className="flex-1 rounded bg-secondary/80 py-1 text-[10px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors cursor-pointer text-center"
-                  >
-                    +10 Scenes
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyJump(String(pairs.length))}
-                    className="flex-1 rounded bg-secondary/80 py-1 text-[10px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors cursor-pointer text-center"
-                  >
-                    Last (#{pairs.length})
-                  </button>
-                </div>
-
-                {/* Scrollable scene list */}
-                <div className="max-h-60 overflow-y-auto space-y-1 pr-1">
-                  {filteredScenes.length === 0 ? (
-                    <div className="py-4 text-center text-xs text-muted-foreground">
-                      No scenes matched your search
-                    </div>
-                  ) : (
-                    filteredScenes.map(({ pair: p, index: i }) => {
-                      const isSelected = i === idx
-                      return (
-                        <button
-                          key={i}
-                          type="button"
-                          onClick={() => {
-                            setIdx(i)
-                            setShowSceneList(false)
-                          }}
-                          className={`w-full flex items-center justify-between rounded-lg px-2.5 py-1.5 text-xs text-left transition-all cursor-pointer ${
-                            isSelected
-                              ? 'bg-primary/20 text-primary font-bold border border-primary/40'
-                              : 'hover:bg-secondary text-foreground'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[11px] font-bold w-7 text-muted-foreground">
-                              #{i + 1}
-                            </span>
-                            <div className="flex flex-col">
-                              <span className="font-mono text-[11px]">
-                                {fmtTime(p.shortStart)} – {fmtTime(p.shortEnd)}
-                              </span>
-                              <span className="font-mono text-[10px] text-muted-foreground">
-                                Movie: {fmtTime(p.movieStart)} – {fmtTime(p.movieEnd)}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <span className="rounded bg-secondary px-1.5 py-0.5 text-[9px] font-mono text-muted-foreground">
-                              c{p.chunkIndex}
-                            </span>
-                            {p.batchVerified === 'confirmed' ? (
-                              <span className="rounded bg-emerald-500/20 text-emerald-400 px-1 py-0.5 text-[9px] font-semibold">
-                                CONFIRMED
-                              </span>
-                            ) : p.batchVerified === 'rejected' ? (
-                              <span className="rounded bg-rose-500/20 text-rose-400 px-1 py-0.5 text-[9px] font-semibold">
-                                REJECTED
-                              </span>
-                            ) : p.viaRescan ? (
-                              <span className="rounded bg-indigo-500/20 text-indigo-300 px-1 py-0.5 text-[9px] font-semibold">
-                                RESCAN
-                              </span>
-                            ) : null}
-                          </div>
-                        </button>
-                      )
-                    })
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
         </div>
       </div>
 
-      {/* Video Preview Grid with Hardware Decoded Smooth Playback */}
+      {/* Video Preview Grid */}
       <div className="mt-3 grid grid-cols-2 gap-2 sm:gap-3">
         {/* Short Video View */}
         <figure className="flex flex-col gap-1.5">
@@ -1073,17 +717,16 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             <video
               ref={shortRef}
               src={src('short')}
-              preload="auto"
+              preload="metadata"
               muted
               playsInline
               className="aspect-video w-full object-contain"
             />
-            {/* Smooth hardware progress line (Direct DOM-ref update without 60fps React re-render) */}
+            {/* Progress line for short video */}
             <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10">
               <div
-                ref={shortBarRef}
-                className="h-full bg-primary"
-                style={{ width: '0%' }}
+                className="h-full bg-primary transition-all duration-75"
+                style={{ width: `${shortProgress}%` }}
               />
             </div>
           </div>
@@ -1110,17 +753,16 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             <video
               ref={movieRef}
               src={src('movie')}
-              preload="auto"
+              preload="metadata"
               muted
               playsInline
               className="aspect-video w-full object-contain"
             />
-            {/* Smooth hardware progress line */}
+            {/* Progress line for movie video */}
             <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10">
               <div
-                ref={movieBarRef}
-                className={`h-full ${isCurrentRescanned ? 'bg-indigo-400' : 'bg-primary'}`}
-                style={{ width: '0%' }}
+                className={`h-full transition-all duration-75 ${isCurrentRescanned ? 'bg-indigo-400' : 'bg-primary'}`}
+                style={{ width: `${movieProgress}%` }}
               />
             </div>
           </div>
@@ -1174,7 +816,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             <button
               type="button"
               onClick={() => setShowConsole((prev) => !prev)}
-              className="text-[11px] font-sans text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="text-[11px] font-sans text-muted-foreground hover:text-foreground transition-colors"
             >
               {showConsole ? 'Minimize Console ▲' : 'Expand Logs ▼'}
             </button>
@@ -1183,7 +825,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <div className="text-[11px] text-indigo-200/90 mb-2 font-sans font-medium flex items-center justify-between">
             <span>{currentTask.progressMsg}</span>
             <span className="text-[10px] text-muted-foreground font-mono">
-              Short {fmtTime(currentTask.shortStart)}–${fmtTime(currentTask.shortEnd)}
+              Short {fmtTime(currentTask.shortStart)}–{fmtTime(currentTask.shortEnd)}
             </span>
           </div>
 
@@ -1214,7 +856,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
       {/* Bottom Action Controls */}
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        {/* Play/Pause Button */}
         <button
           type="button"
           onClick={togglePlay}
@@ -1224,48 +865,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           {playing ? 'Pause both' : 'Play both'}
         </button>
 
-        {/* Continuous Autoplay Mode Button */}
-        <button
-          type="button"
-          onClick={toggleAutoplay}
-          className={`flex items-center gap-1.5 rounded-md px-3.5 py-2 text-xs font-bold transition-all cursor-pointer shadow-sm ${
-            autoplay
-              ? 'bg-emerald-500 text-emerald-950 ring-2 ring-emerald-400 ring-offset-2 ring-offset-background animate-pulse'
-              : 'border border-input bg-card text-foreground hover:bg-secondary'
-          }`}
-          title="Autoplay continuously: automatically moves to next scene when current clip ends. Click or press Space to pause anywhere!"
-        >
-          {autoplay ? <Pause className="size-3.5" aria-hidden /> : <FastForward className="size-3.5" aria-hidden />}
-          <span>{autoplay ? 'Stop Autoplay' : 'Autoplay (Continuous)'}</span>
-        </button>
-
-        {/* Playback Speed Selector */}
-        <div className="flex items-center rounded-md border border-input bg-card/70 p-0.5 text-xs">
-          {([1, 1.25, 1.5] as const).map((spd) => (
-            <button
-              key={spd}
-              type="button"
-              onClick={() => changePlaybackRate(spd)}
-              className={`rounded px-2 py-1 font-mono text-[11px] font-medium transition-colors cursor-pointer ${
-                playbackRate === spd
-                  ? 'bg-primary text-primary-foreground font-bold shadow-xs'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-              title={`Playback speed ${spd}x`}
-            >
-              {spd}x
-            </button>
-          ))}
-        </div>
-
-        {/* Restart Match Playback */}
         <button
           type="button"
           onClick={restart}
           className="flex items-center gap-1.5 rounded-md border border-input bg-card px-3 py-2 text-xs font-medium hover:bg-secondary transition-colors cursor-pointer"
           title="Restart playback from match start (R)"
         >
-          <RotateCcw className="size-3.5" aria-hidden /> Restart
+          <RotateCcw className="size-3.5" aria-hidden /> Restart match
         </button>
 
         {/* Retry / Rescan Button with Model Selection (3.6, 3.7, 3.8) */}
@@ -1278,7 +884,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             }}
             disabled={isCurrentRescanning}
             className="flex items-center gap-1.5 rounded-md border border-indigo-500/50 bg-indigo-500/10 px-3.5 py-2 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 active:scale-95 transition-all disabled:opacity-50 cursor-pointer"
-            title="Rescan this scene with Gemini Models (3.6, 3.7, 3.8) & 4x auto-retry. Runs in background so you can continue reviewing!"
+            title="Choose Gemini Model (3.6, 3.7, 3.8) to rescan this scene with 4x auto-retry"
           >
             {isCurrentRescanning ? (
               <Loader2 className="size-3.5 animate-spin text-indigo-400" aria-hidden />
@@ -1303,7 +909,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
                 <button
                   type="button"
                   onClick={() => setShowModelPicker(false)}
-                  className="text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
+                  className="text-[10px] text-muted-foreground hover:text-foreground"
                 >
                   ✕
                 </button>
@@ -1369,20 +975,12 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         </div>
       </div>
 
-      {/* Floating Bottom Clickable Toast Notification with Sound & Instant Jump Link */}
+      {/* Floating Bottom Toast Notification Banner with Sound & Jump Link */}
       {toastNotification && (
         <div className="fixed bottom-6 right-6 z-50 max-w-sm animate-in slide-in-from-bottom-5 fade-in duration-300">
           <div className="flex items-start gap-3 rounded-xl border border-indigo-500/50 bg-zinc-950/95 p-3.5 shadow-2xl backdrop-blur-md ring-1 ring-indigo-500/20">
-            <div className={`flex size-9 shrink-0 items-center justify-center rounded-lg border ${
-              toastNotification.status === 'success'
-                ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
-                : 'bg-amber-500/20 text-amber-400 border-amber-500/30'
-            }`}>
-              {toastNotification.status === 'success' ? (
-                <Bell className="size-5 animate-bounce" />
-              ) : (
-                <AlertCircle className="size-5" />
-              )}
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
+              <Bell className="size-5 animate-bounce" />
             </div>
             <div className="flex-1 space-y-1">
               <div className="flex items-center justify-between">
@@ -1398,11 +996,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               <p className="text-xs text-muted-foreground leading-snug">{toastNotification.msg}</p>
               <button
                 type="button"
-                onClick={jumpToToastScene}
-                className="mt-1.5 flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-indigo-500 active:scale-95 transition-all cursor-pointer shadow-md"
+                onClick={() => {
+                  setIdx(toastNotification.pairIndex)
+                  setToastNotification(null)
+                }}
+                className="mt-1 flex items-center gap-1 rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-indigo-500 active:scale-95 transition-all cursor-pointer"
               >
-                <span>Jump to Rescanned Scene</span>
-                <ChevronRight className="size-3.5" />
+                Jump to Rescanned Scene →
               </button>
             </div>
           </div>

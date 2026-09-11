@@ -725,7 +725,7 @@ function StitchedPreview({
 
       <video
         ref={videoRef}
-        src={`/api/scans/${scan.id}/media?kind=movie`}
+        src={`/api/scans/${scan.id}/media?kind=movie&preview=1`}
         preload="metadata"
         playsInline
         onTimeUpdate={onTimeUpdate}

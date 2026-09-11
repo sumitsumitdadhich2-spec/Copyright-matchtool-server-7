@@ -34,8 +34,8 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
   const [playing, setPlaying] = useState(false)
   const shortRef = useRef<HTMLVideoElement>(null)
   const movieRef = useRef<HTMLVideoElement>(null)
-  const shortSrc = `/api/scans/${scanId}/media?kind=short`
-  const movieSrc = `/api/scans/${scanId}/media?kind=movie`
+  const shortSrc = `/api/scans/${scanId}/media?kind=short&preview=1`
+  const movieSrc = `/api/scans/${scanId}/media?kind=movie&preview=1`
   const shortDuration = candidate.shortEnd - candidate.shortStart
 
   function pauseBoth(reset = false) {
@@ -44,8 +44,8 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
     shortVideo?.pause()
     movieVideo?.pause()
     if (reset) {
-      if (shortVideo) shortVideo.currentTime = candidate.shortStart
-      if (movieVideo) movieVideo.currentTime = candidate.movieStart
+      if (shortVideo && shortVideo.readyState >= 1) shortVideo.currentTime = candidate.shortStart
+      if (movieVideo && movieVideo.readyState >= 1) movieVideo.currentTime = candidate.movieStart
     }
     setPlaying(false)
   }
@@ -67,8 +67,8 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
     const shortInRange = shortVideo.currentTime >= candidate.shortStart - 0.05 && shortVideo.currentTime < candidate.shortEnd - 0.05
     const movieInRange = movieVideo.currentTime >= candidate.movieStart - 0.05 && movieVideo.currentTime < candidate.movieEnd - 0.05
     const sharedPosition = shortInRange && movieInRange ? Math.min(shortPosition, moviePosition, shortDuration) : 0
-    shortVideo.currentTime = candidate.shortStart + sharedPosition
-    movieVideo.currentTime = candidate.movieStart + sharedPosition
+    if (shortVideo.readyState >= 1) shortVideo.currentTime = candidate.shortStart + sharedPosition
+    if (movieVideo.readyState >= 1) movieVideo.currentTime = candidate.movieStart + sharedPosition
   }
 
   async function togglePlay() {
@@ -98,7 +98,8 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
       return
     }
     const movieTarget = candidate.movieStart + position
-    if (Math.abs(movieVideo.currentTime - movieTarget) > 0.12) movieVideo.currentTime = movieTarget
+    // Tolerance of 0.45s prevents continuous seek-and-pause thrashing while playing
+    if (Math.abs(movieVideo.currentTime - movieTarget) > 0.45) movieVideo.currentTime = movieTarget
   }
 
   function handleNativePause() {

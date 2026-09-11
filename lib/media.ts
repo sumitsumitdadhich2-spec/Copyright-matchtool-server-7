@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { getScan, saveScan, addLog, scanMediaDir, listScans } from './store'
 import type { Scan } from './types'
 import { probeDuration, chunkShort, cleanupSegments, chunkPath, chunkMovie } from './ffmpeg'
@@ -55,6 +56,112 @@ export async function ensureLocalMedia(id: string, kind: MediaKind, force = fals
   })()
   inflight.set(key, job)
   return job
+}
+
+const previewEncoding = new Set<string>()
+
+function triggerBackgroundPreviewEncode(scanId: string, inputPath: string, outputPath: string) {
+  if (previewEncoding.has(scanId)) return
+  previewEncoding.add(scanId)
+
+  void (async () => {
+    try {
+      const tmpOut = `${outputPath}.tmp-${Date.now()}.mp4`
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('ffmpeg', [
+          '-y',
+          '-v', 'error',
+          '-i', inputPath,
+          '-vf', "scale='min(854,iw)':-2",
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-crf', '32',
+          '-c:a', 'aac',
+          '-b:a', '64k',
+          '-movflags', '+faststart',
+          tmpOut,
+        ])
+        proc.on('close', (code) => {
+          if (code === 0) resolve()
+          else reject(new Error(`ffmpeg preview exited with ${code}`))
+        })
+        proc.on('error', reject)
+      })
+
+      if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 1000) {
+        fs.renameSync(tmpOut, outputPath)
+        console.log(`[media] fast 480p preview generated for scan ${scanId} (${(fs.statSync(outputPath).size / (1024 * 1024)).toFixed(1)} MB)`)
+      }
+    } catch (err) {
+      console.warn(`[media] background preview encode skipped for scan ${scanId}:`, err instanceof Error ? err.message : err)
+    } finally {
+      previewEncoding.delete(scanId)
+    }
+  })()
+}
+
+/**
+ * Return a lightweight, fast-loading, seek-optimized video file for browser previews
+ * (Side-by-side compare, missing-scene finder, instant stitched preview, trim panel, etc.).
+ * Prioritizes 480p/faststart copies (e.g. prescan-movie.mp4) over multi-gigabyte raw originals.
+ */
+export async function ensureLocalPreviewMedia(id: string, kind: MediaKind): Promise<string | null> {
+  const dir = scanMediaDir(id)
+
+  if (kind === 'movie') {
+    const scan = getScan(id)
+    const isFullTimeline = !scan?.movieTrimStart || scan.movieTrimStart <= 0.05
+
+    // 1. Direct 480p prescan copy in this scan's directory (already 480p + faststart)
+    if (isFullTimeline) {
+      const prescanCopy = path.join(dir, 'prescan-movie.mp4')
+      if (fs.existsSync(/*turbopackIgnore: true*/ prescanCopy) && fs.statSync(prescanCopy).size > 1000) {
+        return prescanCopy
+      }
+    }
+
+    // 2. Direct preview-movie.mp4 in this scan's directory
+    const previewCopy = path.join(dir, 'preview-movie.mp4')
+    if (fs.existsSync(/*turbopackIgnore: true*/ previewCopy) && fs.statSync(previewCopy).size > 1000) {
+      return previewCopy
+    }
+
+    // 3. Re-use 480p movie copy from another scan of the same movie
+    if (scan && scan.movieName && scan.movieSize && isFullTimeline) {
+      try {
+        const reused = await findAndReusePrescanMovie(
+          id,
+          scan.movieName,
+          scan.movieSize,
+          scan.movieTrimStart ?? 0,
+          scan.movieTrimEnd ?? scan.movieDuration ?? 0,
+        )
+        if (reused && fs.existsSync(/*turbopackIgnore: true*/ reused.copyPath)) {
+          return reused.copyPath
+        }
+      } catch {
+        // non-blocking
+      }
+    }
+
+    // 4. Fallback to original movie.mp4 (which will stream smoothly with 16MB chunks)
+    const original = await ensureLocalMedia(id, 'movie')
+    if (original && fs.existsSync(original)) {
+      const stat = fs.statSync(original)
+      if (stat.size > 150 * 1024 * 1024) {
+        triggerBackgroundPreviewEncode(id, original, previewCopy)
+      }
+    }
+    return original
+  }
+
+  // kind === 'short'
+  const previewShort = path.join(dir, 'preview-short.mp4')
+  if (fs.existsSync(/*turbopackIgnore: true*/ previewShort) && fs.statSync(previewShort).size > 1000) {
+    return previewShort
+  }
+
+  return ensureLocalMedia(id, 'short')
 }
 
 // ---------- Local → S3 mirror ----------

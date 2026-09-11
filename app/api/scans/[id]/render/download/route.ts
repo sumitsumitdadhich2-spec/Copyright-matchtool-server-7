@@ -27,16 +27,35 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
     : {}
 
   const stat = fs.statSync(file)
+  const etag = `"${stat.size}-${Math.floor(stat.mtimeMs)}"`
+  const lastModified = stat.mtime.toUTCString()
+
+  const ifNoneMatch = req.headers.get('if-none-match')
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        ETag: etag,
+        'Cache-Control': 'public, max-age=3600, must-revalidate',
+      },
+    })
+  }
+
   const range = req.headers.get('range')
 
   if (range) {
     const m = range.match(/bytes=(\d+)-(\d*)/)
     if (m) {
       const start = Number(m[1])
-      const end = m[2] ? Math.min(Number(m[2]), stat.size - 1) : Math.min(start + 4 * 1024 * 1024 - 1, stat.size - 1)
       if (start >= stat.size) {
         return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${stat.size}` } })
       }
+      const requestedEnd = m[2] ? Number(m[2]) : undefined
+      const maxChunk = 16 * 1024 * 1024
+      const end = requestedEnd !== undefined
+        ? Math.min(requestedEnd, stat.size - 1)
+        : Math.min(start + maxChunk - 1, stat.size - 1)
+
       const stream = fs.createReadStream(file, { start, end })
       return new Response(toWeb(stream), {
         status: 206,
@@ -45,6 +64,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
           'Accept-Ranges': 'bytes',
           'Content-Length': String(end - start + 1),
           'Content-Type': 'video/mp4',
+          ETag: etag,
+          'Last-Modified': lastModified,
+          'Cache-Control': 'public, max-age=3600, must-revalidate',
           ...dispo,
         },
       })
@@ -58,6 +80,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       'Content-Length': String(stat.size),
       'Accept-Ranges': 'bytes',
       'Content-Type': 'video/mp4',
+      ETag: etag,
+      'Last-Modified': lastModified,
+      'Cache-Control': 'public, max-age=3600, must-revalidate',
       ...dispo,
     },
   })
